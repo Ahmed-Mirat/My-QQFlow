@@ -53,4 +53,21 @@ export const api = {
   loadKeys: () => invoke<{ ok: boolean; keys?: Record<string, string> }>('load_keys'),
 
   clearKey: (qqNumber: string) => invoke<SimpleResponse>('clear_key', { qqNumber }),
+
+  // Advanced export
+  exportHtml: (params: { db_path: string; key: string; output_dir: string; group_ids?: string[]; peer_ids?: string[] }) =>
+    invoke<{ success: boolean; files: string[]; error?: string }>('export_html', { params }),
+
+  exportJson: (params: { db_path: string; key: string; output_dir: string; group_ids?: string[]; peer_ids?: string[] }) =>
+    invoke<{ success: boolean; files: string[]; error?: string }>('export_json', { params }),
+
+  // Reports
+  generateDuoReport: (params: { db_path: string; key: string; peer_uid: string }) =>
+    invoke<any>('generate_duo_report', params),
+
+  generateAnnualReport: (params: { db_path: string; key: string; year: number }) =>
+    invoke<any>('generate_annual_report', params),
+
+  getAvailableYears: (params: { db_path: string; key: string }) =>
+    invoke<number[]>('get_available_years', params),
 }

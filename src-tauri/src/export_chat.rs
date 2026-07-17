@@ -123,6 +123,7 @@ pub struct C2cMsg {
     pub peer: String,
     pub nick: String,
     pub blob: Vec<u8>,
+    pub is_self: bool,  // true = 我发的, false = 对方发的
 }
 
 pub struct MessageStore {
@@ -130,12 +131,13 @@ pub struct MessageStore {
     pub c2c_msgs: HashMap<String, Vec<C2cMsg>>,
     pub uid_map: HashMap<String, String>,
     pub group_names: HashMap<String, String>,
+    pub self_uid: String, // 登录账号自身的 UID，用于识别对话中的"我"
 }
 
 impl MessageStore {
     /// Stream all messages from the database and build in-memory HashMaps.
     /// No writes to disk — purely read-only streaming scan.
-    pub fn load(conn: &Connection) -> Result<Self, String> {
+    pub fn load(conn: &Connection, self_qq: &str) -> Result<Self, String> {
         use std::time::Instant;
 
         eprintln!("[MessageStore::load] 开始加载 UID 映射和群名称...");
@@ -144,6 +146,12 @@ impl MessageStore {
         let group_names = load_group_names(conn);
         eprintln!("[MessageStore::load] UID={}, 群名={}, 耗时 {:.1}s",
             uid_map.len(), group_names.len(), t0.elapsed().as_secs_f32());
+
+        // 检测 self_uid: 从 uid_map 反查 QQ 号对应的 UID
+        let self_uid = uid_map.iter()
+            .find(|(_, qq)| *qq == self_qq)
+            .map(|(uid, _)| uid.clone())
+            .unwrap_or_default();
 
         // ── Group messages ──
         let mut group_msgs: HashMap<String, Vec<GroupMsg>> = HashMap::new();
@@ -177,35 +185,55 @@ impl MessageStore {
 
         // ── C2C messages ──
         let mut c2c_msgs: HashMap<String, Vec<C2cMsg>> = HashMap::new();
+        // 尝试同时读取 sender_uid 列 (40033) 用于识别"我"
+        let has_sender_col = check_column_exists(conn, "c2c_msg_table", "40033");
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT \"40020\", \"40001\", \"40093\", \"40800\" FROM c2c_msg_table"
+            if has_sender_col {
+                "SELECT \"40020\", \"40001\", \"40093\", \"40800\", \"40033\" FROM c2c_msg_table"
+            } else {
+                "SELECT \"40020\", \"40001\", \"40093\", \"40800\" FROM c2c_msg_table"
+            }
         ) {
             if let Ok(rows) = stmt.query_map([], |row| {
+                let sender_uid: String = if has_sender_col {
+                    row.get::<_, String>(4).unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 Ok((
                     row.get::<_, String>(0).unwrap_or_default(),
                     row.get::<_, i64>(1).unwrap_or(0),
                     row.get::<_, String>(2).unwrap_or_default(),
                     row.get::<_, Vec<u8>>(3).unwrap_or_default(),
+                    sender_uid,
                 ))
             }) {
                 eprintln!("[MessageStore::load] 开始加载私聊消息...");
                 let mut count = 0u64;
                 for row in rows.flatten() {
-                    let (peer, msg_id, nick, blob) = row;
+                    let (peer, msg_id, nick, blob, sender_uid) = row;
+                    // 判断是否自己发的:
+                    // 1. sender_uid (40033) == self_uid
+                    // 2. 如果 sender_uid 为空, 则 nick 为空时判断为己发 (QQ NT 的常见模式)
+                    let is_self = if !sender_uid.is_empty() && !self_uid.is_empty() {
+                        sender_uid == self_uid
+                    } else {
+                        nick.is_empty() || nib_parse_sender_is_self(&blob, &peer)
+                    };
                     let peer_clone = peer.clone();
-                    c2c_msgs.entry(peer).or_default().push(C2cMsg { msg_id, peer: peer_clone, nick, blob });
+                    c2c_msgs.entry(peer).or_default().push(C2cMsg { msg_id, peer: peer_clone, nick, blob, is_self });
                     count += 1;
                 }
                 eprintln!("[MessageStore::load] 私聊消息加载完成: {} 条, {} 个联系人", count, c2c_msgs.len());
             }
         }
 
-        Ok(MessageStore { group_msgs, c2c_msgs, uid_map, group_names })
+        Ok(MessageStore { group_msgs, c2c_msgs, uid_map, group_names, self_uid })
     }
 
     /// Load the store from a database file, with progress feedback via optional log.
     pub fn load_with_progress(
-        db_path: &str, key: &str,
+        db_path: &str, key: &str, self_qq: &str,
         progress_log: Option<&std::sync::Mutex<Vec<crate::commands::LogMessage>>>,
     ) -> Result<Self, String> {
         use std::time::Instant;
@@ -227,6 +255,11 @@ impl MessageStore {
         let uid_map = load_uid_map(&conn);
         let group_names = load_group_names(&conn);
         log(&format!("UID映射 {} 条, 群名称 {} 个 ({:.1}s)", uid_map.len(), group_names.len(), t0.elapsed().as_secs_f32()));
+
+        let self_uid = uid_map.iter()
+            .find(|(_, qq)| *qq == self_qq)
+            .map(|(uid, _)| uid.clone())
+            .unwrap_or_default();
 
         // ── Group messages ──
         log("正在加载群消息...");
@@ -261,29 +294,45 @@ impl MessageStore {
         log("正在加载私聊消息...");
         let mut c2c_msgs: HashMap<String, Vec<C2cMsg>> = HashMap::new();
         let t2 = Instant::now();
+        let has_sender_col2 = check_column_exists(&conn, "c2c_msg_table", "40033");
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT \"40020\", \"40001\", \"40093\", \"40800\" FROM c2c_msg_table"
+            if has_sender_col2 {
+                "SELECT \"40020\", \"40001\", \"40093\", \"40800\", \"40033\" FROM c2c_msg_table"
+            } else {
+                "SELECT \"40020\", \"40001\", \"40093\", \"40800\" FROM c2c_msg_table"
+            }
         ) {
             if let Ok(rows) = stmt.query_map([], |row| {
+                let sender_uid: String = if has_sender_col2 {
+                    row.get::<_, String>(4).unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 Ok((
                     row.get::<_, String>(0).unwrap_or_default(),
                     row.get::<_, i64>(1).unwrap_or(0),
                     row.get::<_, String>(2).unwrap_or_default(),
                     row.get::<_, Vec<u8>>(3).unwrap_or_default(),
+                    sender_uid,
                 ))
             }) {
                 let mut count = 0u64;
                 for row in rows.flatten() {
-                    let (peer, msg_id, nick, blob) = row;
+                    let (peer, msg_id, nick, blob, sender_uid) = row;
+                    let is_self = if !sender_uid.is_empty() && !self_uid.is_empty() {
+                        sender_uid == self_uid
+                    } else {
+                        nick.is_empty() || nib_parse_sender_is_self(&blob, &peer)
+                    };
                     let peer_clone = peer.clone();
-                    c2c_msgs.entry(peer).or_default().push(C2cMsg { msg_id, peer: peer_clone, nick, blob });
+                    c2c_msgs.entry(peer).or_default().push(C2cMsg { msg_id, peer: peer_clone, nick, blob, is_self });
                     count += 1;
                 }
                 log(&format!("私聊消息加载完成: {} 条, {} 个联系人 ({:.1}s)", count, c2c_msgs.len(), t2.elapsed().as_secs_f32()));
             }
         }
 
-        Ok(MessageStore { group_msgs, c2c_msgs, uid_map, group_names })
+        Ok(MessageStore { group_msgs, c2c_msgs, uid_map, group_names, self_uid })
     }
 }
 
@@ -666,9 +715,55 @@ fn find_group_info_table(conn: &Connection) -> Option<String> {
     None
 }
 
+/// Extract QQ number from db_path.
+/// Path format: .../Tencent Files/{QQ}/nt_qq/nt_db/nt_msg.db
+pub fn extract_qq_from_path(db_path: &str) -> String {
+    // Look for "Tencent Files" directory and extract the next path component
+    let normalized = db_path.replace('\\', "/");
+    if let Some(pos) = normalized.find("Tencent Files/") {
+        let rest = &normalized[pos + "Tencent Files/".len()..];
+        if let Some(end) = rest.find('/') {
+            let qq = &rest[..end];
+            if qq.chars().all(|c| c.is_ascii_digit()) {
+                return qq.to_string();
+            }
+        }
+    }
+    // Fallback: scan path for a digit-only directory component
+    for part in normalized.split('/') {
+        if part.len() >= 5 && part.len() <= 12 && part.chars().all(|c| c.is_ascii_digit()) {
+            return part.to_string();
+        }
+    }
+    String::new()
+}
+
 /// Sanitize a string for use as a filename (remove Windows-illegal chars).
 pub fn sanitize_filename(s: &str) -> String {
     s.chars().map(|c| match c { '<'|'>'|':'|'"'|'/'|'\\'|'|'|'?'|'*' => '_', _ => c }).collect()
+}
+
+/// Check if a column exists in a table.
+fn check_column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    if let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info(\"{}\")", table.replace('"', "\"\""))) {
+        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) {
+            return rows.flatten().any(|name| name == column);
+        }
+    }
+    false
+}
+
+/// Quick BLOB-based sender detection: scan the first bytes for sender_uin patterns.
+/// Falls back to true (assume self) if the peer UID doesn't appear in the blob.
+fn nib_parse_sender_is_self(blob: &[u8], peer_uid: &str) -> bool {
+    if blob.len() < 4 { return true; }
+    // Heuristic: if the peer UID appears as a substring in the blob,
+    // the message is FROM the peer (not self). Otherwise assume self.
+    let peer_bytes = peer_uid.as_bytes();
+    if peer_bytes.len() >= 5 && blob.windows(peer_bytes.len()).any(|w| w == peer_bytes) {
+        return false; // peer's UID found → message is from peer
+    }
+    true // peer's UID not found → likely self-sent
 }
 
 /// Export all chat records as TXT files.
@@ -856,8 +951,13 @@ pub fn decrypt_and_export(
                     writeln!(f, "———— {} ————", date).ok();
                     writeln!(f).ok();
                 }
-                let who = if !m.nick.is_empty() { m.nick.clone() }
-                    else { store.uid_map.get(&m.peer).cloned().unwrap_or_else(|| m.peer.clone()) };
+                // 区分"我"和"对方"
+                let who = if m.is_self {
+                    "我".to_string()
+                } else {
+                    if !m.nick.is_empty() { m.nick.clone() }
+                    else { store.uid_map.get(&m.peer).cloned().unwrap_or_else(|| m.peer.clone()) }
+                };
                 let parsed = extract_text(&m.blob);
                 let time_str = if time.is_empty() { String::new() } else { format!("[{}] ", time) };
                 if let Err(e) = writeln!(f, "{}{}：", time_str, who) {

@@ -3,6 +3,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod advanced_export;
 mod commands;
 mod db_scan;
 mod export_chat;
@@ -32,6 +33,11 @@ fn main() {
             commands::save_key,
             commands::load_keys,
             commands::clear_key,
+            commands::export_html,
+            commands::export_json,
+            commands::generate_duo_report,
+            commands::generate_annual_report,
+            commands::get_available_years,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

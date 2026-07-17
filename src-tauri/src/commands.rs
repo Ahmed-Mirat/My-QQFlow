@@ -772,8 +772,9 @@ pub fn start_export(state: State<'_, AppState>, params: ExportParams) -> SimpleR
                         text: "正在加载数据库（首次约需30-60秒，请耐心等待）...".to_string(),
                     });
                     eprintln!("[start_export] 开始加载 MessageStore: {}", &params.db_path);
+                    let self_qq = export_chat::extract_qq_from_path(&params.db_path);
                     match export_chat::MessageStore::load_with_progress(
-                        &params.db_path, &params.key,
+                        &params.db_path, &params.key, &self_qq,
                         Some(&log),
                     ) {
                         Ok(s) => {
@@ -937,7 +938,8 @@ pub async fn analyze_group(app: tauri::AppHandle, params: GroupAnalysisParams) -
                         None => {
                             drop(guard);
                             eprintln!("[analyze_group] 缓存未命中, 加载 MessageStore...");
-                            match export_chat::MessageStore::load_with_progress(&params.db_path, &params.key, None) {
+                            let self_qq = export_chat::extract_qq_from_path(&params.db_path);
+                            match export_chat::MessageStore::load_with_progress(&params.db_path, &params.key, &self_qq, None) {
                                 Ok(s) => {
                                     let s = Arc::new(s);
                                     let mut g = store_mutex.lock().unwrap();
@@ -992,7 +994,8 @@ pub async fn analyze_private(app: tauri::AppHandle, params: PrivateAnalysisParam
                         None => {
                             drop(guard);
                             eprintln!("[analyze_private] 缓存未命中, 加载 MessageStore...");
-                            match export_chat::MessageStore::load_with_progress(&params.db_path, &params.key, None) {
+                            let self_qq = export_chat::extract_qq_from_path(&params.db_path);
+                            match export_chat::MessageStore::load_with_progress(&params.db_path, &params.key, &self_qq, None) {
                                 Ok(s) => {
                                     let s = Arc::new(s);
                                     let mut g = store_mutex.lock().unwrap();
@@ -1039,7 +1042,8 @@ fn load_store_if_needed(
     let conn = export_chat::open_db_for_analysis(db_path, key)
         .map_err(|e| format!("打开数据库失败: {}", e))?;
     eprintln!("[load_store_if_needed] 数据库已打开，开始加载消息...");
-    let store = Arc::new(export_chat::MessageStore::load(&conn)
+    let self_qq = export_chat::extract_qq_from_path(db_path);
+    let store = Arc::new(export_chat::MessageStore::load(&conn, &self_qq)
         .map_err(|e| format!("加载消息失败: {}", e))?);
     eprintln!("[load_store_if_needed] 消息加载完成: {} 个群, {} 个私聊",
         store.group_msgs.len(), store.c2c_msgs.len());
@@ -1225,4 +1229,177 @@ fn find_pattern(data: &[u8], pattern: &[u8], start: usize, end: usize) -> Option
         }
     }
     None
+}
+
+// ══════════════════════════════════════════════════════════════
+// Advanced Export Commands (HTML, JSON, Duo Report, Annual Report)
+// ══════════════════════════════════════════════════════════════
+
+use crate::advanced_export;
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AdvancedExportParams {
+    pub db_path: String,
+    pub key: String,
+    pub output_dir: String,
+    pub group_ids: Option<Vec<String>>,
+    pub peer_ids: Option<Vec<String>>,
+    pub format: Option<String>, // "html" | "json"
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdvancedExportResult {
+    pub success: bool,
+    pub files: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// HTML / JSON export for selected conversations
+#[tauri::command]
+pub fn export_html(
+    state: State<'_, AppState>,
+    params: AdvancedExportParams,
+) -> AdvancedExportResult {
+    export_advanced(state, params, "html")
+}
+
+#[tauri::command]
+pub fn export_json(
+    state: State<'_, AppState>,
+    params: AdvancedExportParams,
+) -> AdvancedExportResult {
+    export_advanced(state, params, "json")
+}
+
+fn export_advanced(
+    state: State<'_, AppState>,
+    params: AdvancedExportParams,
+    fmt: &str,
+) -> AdvancedExportResult {
+    let store = match load_or_get_store(&state, &params.db_path, &params.key) {
+        Ok(s) => s,
+        Err(e) => return AdvancedExportResult { success: false, files: vec![], error: Some(e) },
+    };
+
+    let mut files = Vec::new();
+    let output = &params.output_dir;
+
+    // Export selected groups
+    if let Some(ref group_ids) = params.group_ids {
+        for gid in group_ids {
+            let result = match fmt {
+                "html" => advanced_export::export_html_group(&store, gid, output),
+                "json" => advanced_export::export_json_group(&store, gid, output),
+                _ => Err("unknown format".to_string()),
+            };
+            match result {
+                Ok(path) => files.push(path),
+                Err(e) => eprintln!("[advanced_export] 群 {} 导出失败: {}", gid, e),
+            }
+        }
+    }
+
+    // Export selected private chats
+    if let Some(ref peer_ids) = params.peer_ids {
+        for pid in peer_ids {
+            let result = match fmt {
+                "html" => advanced_export::export_html_c2c(&store, pid, output),
+                "json" => advanced_export::export_json_c2c(&store, pid, output),
+                _ => Err("unknown format".to_string()),
+            };
+            match result {
+                Ok(path) => files.push(path),
+                Err(e) => eprintln!("[advanced_export] 私聊 {} 导出失败: {}", pid, e),
+            }
+        }
+    }
+
+    AdvancedExportResult { success: !files.is_empty(), files, error: None }
+}
+
+fn load_or_get_store(
+    state: &State<'_, AppState>,
+    db_path: &str,
+    key: &str,
+) -> Result<Arc<export_chat::MessageStore>, String> {
+    // Check cache first
+    {
+        let guard = state.msg_store.lock().unwrap();
+        if let Some(s) = guard.get(db_path) {
+            return Ok(s.clone());
+        }
+    }
+
+    // Load from DB
+    let self_qq = export_chat::extract_qq_from_path(db_path);
+    let conn = export_chat::open_db_for_analysis(db_path, key)?;
+    let store = Arc::new(export_chat::MessageStore::load(&conn, &self_qq)
+        .map_err(|e| format!("加载消息失败: {}", e))?);
+
+    // Cache it
+    let mut guard = state.msg_store.lock().unwrap();
+    guard.insert(db_path.to_string(), store.clone());
+    Ok(store)
+}
+
+/// Generate duo report for a specific contact
+#[tauri::command]
+pub fn generate_duo_report(
+    state: State<'_, AppState>,
+    db_path: String,
+    key: String,
+    peer_uid: String,
+) -> Result<advanced_export::DuoReport, String> {
+    let store = load_or_get_store(&state, &db_path, &key)?;
+    advanced_export::generate_duo_report(&store, &peer_uid)
+}
+
+/// Generate annual report for a given year
+#[tauri::command]
+pub fn generate_annual_report(
+    state: State<'_, AppState>,
+    db_path: String,
+    key: String,
+    year: i32,
+) -> Result<advanced_export::AnnualReport, String> {
+    let store = load_or_get_store(&state, &db_path, &key)?;
+    advanced_export::generate_annual_report(&store, year)
+}
+
+/// Get list of years that have message data
+#[tauri::command]
+pub fn get_available_years(
+    state: State<'_, AppState>,
+    db_path: String,
+    key: String,
+) -> Result<Vec<i32>, String> {
+    let store = load_or_get_store(&state, &db_path, &key)?;
+
+    let mut years: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+
+    for msgs in store.group_msgs.values() {
+        for m in msgs {
+            if let Some(dt) = crate::analysis::normalize_ts(m.msg_id) {
+                if dt > 0 {
+                    if let Some(d) = chrono::NaiveDateTime::from_timestamp_opt(dt, 0) {
+                        years.insert(d.year());
+                    }
+                }
+            }
+        }
+    }
+    for msgs in store.c2c_msgs.values() {
+        for m in msgs {
+            if let Some(dt) = crate::analysis::normalize_ts(m.msg_id) {
+                if dt > 0 {
+                    if let Some(d) = chrono::NaiveDateTime::from_timestamp_opt(dt, 0) {
+                        years.insert(d.year());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(years.into_iter().collect())
 }

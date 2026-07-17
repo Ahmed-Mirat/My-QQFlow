@@ -87,11 +87,56 @@ pub struct CsvExportData {
 
 // ── helpers ──
 
+// QQ NT snowflake epoch: 2023-01-01 00:00:00 UTC (1672531200000 ms)
+// 不同版本可能不同，用 range check 自适应
+const QQ_NT_EPOCH_CANDIDATES: &[(i64, &str)] = &[
+    (1_672_531_200_000, "2023-01-01"),
+    (1_680_288_000_000, "2023-04-01"),
+    (1_577_836_800_000, "2020-01-01"),
+    (1_600_000_000_000, "2020-09-13"),
+    (1_700_000_000_000, "2023-11-14"),
+];
+
 pub fn normalize_ts(ts: i64) -> i64 {
     if ts == 0 { return 0 }
-    if ts > 1_000_000_000_000_000_000 { ts / 1_000_000_000 }
-    else if ts > 1_000_000_000_000 { ts / 1_000 }
-    else { ts }
+
+    // 纳秒级 Unix 时间戳 (QQ 旧版格式)
+    if ts > 1_500_000_000_000_000_000 {
+        return ts / 1_000_000_000;
+    }
+
+    // 毫秒级 Unix 时间戳
+    if ts > 1_500_000_000_000 && ts < 2_000_000_000_000 {
+        return ts / 1_000;
+    }
+
+    // 秒级 Unix 时间戳 (2020-2030 范围)
+    if ts > 1_577_836_800 && ts < 1_900_000_000 {
+        return ts;
+    }
+
+    // Snowflake ID: [timestamp_ms(32bit)] [worker+seq(32bit)]
+    // 尝试多种右移位数和 epoch 组合，找到落在合理范围的
+    for &shift in &[22, 23, 24, 32] {
+        let extracted = (ts >> shift) as i64;
+        // 检测是否是合理的秒级时间戳 (需要加 epoch)
+        for &(epoch_ms, _label) in QQ_NT_EPOCH_CANDIDATES {
+            let candidate_ms = extracted + epoch_ms;
+            let candidate_sec = candidate_ms / 1000;
+            // 2020-01-01 ~ 2030-01-01 范围内
+            if candidate_sec > 1_577_836_800 && candidate_sec < 1_893_456_000 {
+                return candidate_sec;
+            }
+        }
+        // 也检测是否是直接的秒级偏移
+        if extracted > 1_577_836_800 && extracted < 1_900_000_000 {
+            return extracted;
+        }
+    }
+
+    // 无法识别，记录并返回一个合理的默认值
+    eprintln!("[normalize_ts] 无法识别时间戳格式: {} (0x{:x}), 尝试不同shift均失败", ts, ts);
+    0
 }
 
 pub fn ts_to_str(ts: i64) -> String {
@@ -547,7 +592,9 @@ pub fn export_csv(
             file.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|e| e.to_string())?;
             let mut wtr = csv::Writer::from_writer(file);
             wtr.write_record(["时间", "发送者", "类型", "内容"]).map_err(|e| e.to_string())?;
-            for m in msgs {
+            let mut sorted: Vec<&crate::export_chat::GroupMsg> = msgs.iter().collect();
+            sorted.sort_by_key(|m| m.msg_id);
+            for m in &sorted {
                 let sender = if !m.nick.is_empty() { &m.nick } else { uid_map.get(&m.uid).map(|s| s.as_str()).unwrap_or(&m.uid) };
                 let parsed = extract_text(&m.blob);
                 wtr.write_record([&ts_to_str(m.msg_id), sender, &parsed.msg_type, &parsed.content])
@@ -582,7 +629,10 @@ pub fn export_csv(
             file.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|e| e.to_string())?;
             let mut wtr = csv::Writer::from_writer(file);
             wtr.write_record(["时间", "发送者", "类型", "内容"]).map_err(|e| e.to_string())?;
-            for m in msgs {
+            // Sort by msg_id for chronological order
+            let mut sorted: Vec<&crate::export_chat::C2cMsg> = msgs.iter().collect();
+            sorted.sort_by_key(|m| m.msg_id);
+            for m in &sorted {
                 let sender = if !m.nick.is_empty() { &m.nick } else { uid_map.get(&m.peer).map(|s| s.as_str()).unwrap_or(&m.peer) };
                 let parsed = extract_text(&m.blob);
                 wtr.write_record([&ts_to_str(m.msg_id), sender, &parsed.msg_type, &parsed.content])

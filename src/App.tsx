@@ -9,6 +9,7 @@ import AnalysisPage from './pages/AnalysisPage'
 import SettingsPage from './pages/SettingsPage'
 import { useState } from 'react'
 import './App.scss'
+import './styles/global.scss'
 
 function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
