@@ -4,7 +4,9 @@
 use crate::analysis;
 use crate::db_scan;
 use crate::export_chat;
+use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{Manager, State};
@@ -1235,8 +1237,6 @@ fn find_pattern(data: &[u8], pattern: &[u8], start: usize, end: usize) -> Option
 // Advanced Export Commands (HTML, JSON, Duo Report, Annual Report)
 // ══════════════════════════════════════════════════════════════
 
-use crate::advanced_export;
-
 #[derive(Debug, serde::Deserialize)]
 pub struct AdvancedExportParams {
     pub db_path: String,
@@ -1376,26 +1376,24 @@ pub fn get_available_years(
 ) -> Result<Vec<i32>, String> {
     let store = load_or_get_store(&state, &db_path, &key)?;
 
-    let mut years: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+    let mut years: BTreeSet<i32> = BTreeSet::new();
 
     for msgs in store.group_msgs.values() {
         for m in msgs {
-            if let Some(dt) = crate::analysis::normalize_ts(m.msg_id) {
-                if dt > 0 {
-                    if let Some(d) = chrono::NaiveDateTime::from_timestamp_opt(dt, 0) {
-                        years.insert(d.year());
-                    }
+            let ts = analysis::normalize_ts(m.msg_id);
+            if ts > 0 {
+                if let Some(d) = NaiveDateTime::from_timestamp_opt(ts, 0) {
+                    years.insert(d.year());
                 }
             }
         }
     }
     for msgs in store.c2c_msgs.values() {
         for m in msgs {
-            if let Some(dt) = crate::analysis::normalize_ts(m.msg_id) {
-                if dt > 0 {
-                    if let Some(d) = chrono::NaiveDateTime::from_timestamp_opt(dt, 0) {
-                        years.insert(d.year());
-                    }
+            let ts = analysis::normalize_ts(m.msg_id);
+            if ts > 0 {
+                if let Some(d) = NaiveDateTime::from_timestamp_opt(ts, 0) {
+                    years.insert(d.year());
                 }
             }
         }

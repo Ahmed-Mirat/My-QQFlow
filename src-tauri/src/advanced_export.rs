@@ -51,26 +51,6 @@ fn avatar_of(name: &str) -> String {
     name.chars().next().map(|c| c.to_string()).unwrap_or_else(|| "?".to_string())
 }
 
-/// Count messages in store for a given year
-fn count_year_messages(store: &MessageStore, year: i32) -> usize {
-    let mut count = 0usize;
-    for msgs in store.group_msgs.values() {
-        for m in msgs {
-            if let Some(dt) = ts_to_datetime(m.msg_id) {
-                if dt.year() == year { count += 1; }
-            }
-        }
-    }
-    for msgs in store.c2c_msgs.values() {
-        for m in msgs {
-            if let Some(dt) = ts_to_datetime(m.msg_id) {
-                if dt.year() == year { count += 1; }
-            }
-        }
-    }
-    count
-}
-
 // ══════════════════════════════════════════════════════════════════════
 // 1. HTML EXPORT
 // ══════════════════════════════════════════════════════════════════════
@@ -264,27 +244,27 @@ pub fn export_html_group(
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct JsonHeader { version: String, exported_at: i64, generator: String }
+pub struct JsonHeader { pub version: String, pub exported_at: i64, pub generator: String }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct JsonMeta { name: String, platform: String, r#type: String, group_id: Option<String> }
+pub struct JsonMeta { pub name: String, pub platform: String, pub r#type: String, pub group_id: Option<String> }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct JsonMember { platform_id: String, account_name: String, group_nickname: Option<String> }
+pub struct JsonMember { pub platform_id: String, pub account_name: String, pub group_nickname: Option<String> }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct JsonMessage {
-    sender: String, account_name: String, group_nickname: Option<String>,
-    timestamp: i64, r#type: i32, content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")] platform_message_id: Option<String>,
+pub struct JsonMessage {
+    pub sender: String, pub account_name: String, pub group_nickname: Option<String>,
+    pub timestamp: i64, pub r#type: i32, pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub platform_message_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct JsonDoc { header: JsonHeader, meta: JsonMeta, members: Vec<JsonMember>, messages: Vec<JsonMessage> }
+pub struct JsonDoc { pub header: JsonHeader, pub meta: JsonMeta, pub members: Vec<JsonMember>, pub messages: Vec<JsonMessage> }
 
 fn json_msg_type(t: &str) -> i32 {
     match t { "text"=>0, "image"=>1, "voice"=>2, "video"=>3, "system"=>4, "miniapp"=>5, "recall"=>6, _=>99 }

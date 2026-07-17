@@ -87,7 +87,7 @@ function AnnualReportTab() {
             <div className="stat-card"><div className="stat-number">{data.totalMessages.toLocaleString()}</div><div className="stat-label">总消息数</div></div>
             <div className="stat-card"><div className="stat-number">{data.totalContacts}</div><div className="stat-label">联系人</div></div>
             <div className="stat-card"><div className="stat-number">{data.totalGroups}</div><div className="stat-label">群聊</div></div>
-            <div className="stat-card"><div className="stat-number">{data.activeDays}</div><div className="stat-label">活跃天数</div></div>
+            <div className="stat-card"><div className="stat-number">{data.activeContactsCount + data.activeGroupsCount}</div><div className="stat-label">活跃会话</div></div>
             <div className="stat-card"><div className="stat-number">{data.newContactsYear}</div><div className="stat-label">新增好友</div></div>
             <div className="stat-card"><div className="stat-number">{data.totalTextLength.toLocaleString()}</div><div className="stat-label">总字数</div></div>
           </div>
