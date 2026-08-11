@@ -15,15 +15,15 @@ QQFlow 是一款用于导出 QQ NT（新版 QQ）聊天记录的桌面工具。Q
 | 桌面框架 | Electron 33 | Tauri 2 |
 | 后端语言 | Python + Flask | Rust (原生) |
 | 数据库解密 | sqlcipher3 (Python) | rusqlite + bundled-sqlcipher |
-| 密钥提取 | PowerShell + C# (P/Invoke) | Rust (windows crate) |
+| 密钥提取 | PowerShell + C# (P/Invoke) | Rust Debug API / macOS LLDB |
 | 安装包大小 | ~150MB (含 Python runtime) | ~10MB |
 | 内存占用 | ~200MB | ~30MB |
 
 ### 技术栈
 
 **前端：** React 18 + TypeScript + Vite + SCSS + ECharts + Lucide Icons
-**后端：** Rust + Tauri 2 + rusqlite (SQLCipher) + windows crate
-**打包：** Tauri CLI (MSI / NSIS)
+**后端：** Rust + Tauri 2 + rusqlite (SQLCipher) + windows crate + LLDB
+**打包：** Tauri CLI (MSI / NSIS / DMG / App)
 
 ### 灵感来源
 
@@ -31,7 +31,7 @@ QQFlow 是一款用于导出 QQ NT（新版 QQ）聊天记录的桌面工具。Q
 
 ## 功能
 
-- **密钥提取** — 通过 Windows Debug API 注入 QQ 进程，自动提取 SQLCipher 数据库加密密钥
+- **密钥提取** — Windows 使用 Debug API，macOS 使用 LLDB，自动捕获并验证 SQLCipher 数据库密钥
 - **数据库扫描** — 自动扫描本机所有 QQ 账号的数据库文件
 - **聊天解密** — 解密 SQLCipher 加密的聊天数据库（流式复制 + 磁盘缓存）
 - **TXT 导出** — 群聊/私聊记录导出为可读 TXT，支持选择性导出指定群聊
@@ -43,9 +43,9 @@ QQFlow 是一款用于导出 QQ NT（新版 QQ）聊天记录的桌面工具。Q
 ## 工作原理
 
 ```
-QQ 进程 (qq.exe)
+QQ 进程 (Windows / macOS)
     │
-    ▼  Windows Debug API → 提取 SQLCipher 密钥
+    ▼  Windows Debug API / macOS LLDB → 提取并验证 SQLCipher 密钥
 密钥 (16字节 ASCII)
     │
     ▼  std::io::copy 流式复制 (跳过 1024B 头部) → 磁盘缓存 (%TEMP%/qqflow_cache/)
@@ -65,6 +65,7 @@ MessageStore (内存常驻, O(1) 查找)
 
 **运行时（用户）：**
 - Windows 10/11（64 位）
+- macOS（Apple Silicon）
 - QQ NT（新版 QQ，基于 Electron 架构）
 
 **开发 / 构建：**
@@ -99,8 +100,10 @@ npx tauri build
 
 | 格式 | 路径 | 说明 |
 |---|---|---|
-| MSI | `msi/QQFlow_1.1.5_x64_en-US.msi` | Windows Installer，适合企业部署 |
-| NSIS | `nsis/QQFlow_1.1.5_x64-setup.exe` | 安装向导，适合普通用户 |
+| MSI | `msi/QQFlow_1.1.6_x64_en-US.msi` | Windows Installer，适合企业部署 |
+| NSIS | `nsis/QQFlow_1.1.6_x64-setup.exe` | Windows 安装向导，适合普通用户 |
+| DMG | `dmg/QQFlow_1.1.6_aarch64.dmg` | macOS Apple Silicon 磁盘映像 |
+| App | `macos/QQFlow.app` | macOS 应用包 |
 
 ## 项目结构
 
@@ -117,7 +120,8 @@ qqflow-rust/
 │       ├── db_scan.rs              # QQ 数据库文件扫描
 │       ├── export_chat.rs          # 数据库解密与聊天记录导出
 │       ├── analysis.rs             # 聊天统计分析
-│       └── message_parser.rs       # QQ 消息 BLOB 二进制解析
+│       ├── message_parser.rs       # QQ 消息 BLOB 二进制解析
+│       └── qq_key_extractor_macos.py # macOS LLDB 密钥捕获脚本
 │
 ├── src/                            # React 前端
 │   ├── main.tsx                    # 应用入口
@@ -141,6 +145,7 @@ qqflow-rust/
 │   └── styles/main.scss            # 全局 SCSS 变量与基础样式
 │
 ├── package.json
+├── .github/workflows/release.yml   # Windows / macOS 自动构建发布
 ├── vite.config.ts
 ├── tsconfig.json
 └── index.html
@@ -215,7 +220,15 @@ HTTP_PROXY="http://127.0.0.1:端口" HTTPS_PROXY="http://127.0.0.1:端口" npx t
 
 ## 更新记录
 
-### v1.1.5（当前版本）
+### v1.1.6（当前版本）
+
+- 新增 macOS Apple Silicon 的密钥提取、数据库扫描与应用打包
+- Windows 版同步构建 MSI / NSIS 安装包
+- 私聊按会话对端归并，完整导出双向聊天记录
+- 联系人优先显示实际 QQ 昵称，保留备注、QQ 号和 UID 回退
+- 修复 macOS 密钥保存路径与默认导出目录
+
+### v1.1.5
 
 首个正式版本。包含完整的密钥提取、数据库解密、聊天导出和统计分析功能。
 
@@ -253,7 +266,7 @@ HTTP_PROXY="http://127.0.0.1:端口" HTTPS_PROXY="http://127.0.0.1:端口" npx t
 - 导出的聊天记录可能包含他人的个人信息（昵称、头像、发言内容等），请妥善保管，**未经授权不得传播或公开**
 
 ### 技术风险
-- 本工具通过 Windows Debug API 注入 QQ 进程提取加密密钥，**可能触发安全软件报警**（如杀毒软件、EDR）
+- 本工具通过 Windows Debug API 或 macOS LLDB 附加 QQ 进程提取加密密钥，**可能触发安全软件或系统调试提示**
 - QQ 版本更新后，数据库结构、加密方式或进程行为可能发生变化，导致本工具**失效或产生不可预期的结果**
 - 密钥提取过程中会临时启动并调试 QQ 进程，**请确保 QQ 已关闭**，否则可能导致 QQ 异常
 - 解密后的数据库缓存存储在系统临时目录（`%TEMP%/qqflow_cache/`），使用完毕后**建议手动清理**

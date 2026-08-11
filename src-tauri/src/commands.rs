@@ -997,20 +997,37 @@ pub fn get_key_status(state: State<'_, AppState>) -> KeyStatusResponse {
 // ── Export ──
 
 fn default_export_dir() -> String {
-    #[cfg(any(windows, target_os = "macos"))]
-    let base = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
+    #[cfg(windows)]
+    {
+        // Preserve the original Windows default: next to the executable.
+        let mut path = std::env::current_exe().unwrap_or_default();
+        path.pop();
+        path.push("output");
+        return path.to_string_lossy().to_string();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let base = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        return base
+            .join("Documents")
+            .join("QQFlow")
+            .join("exports")
+            .to_string_lossy()
+            .to_string();
+    }
     #[cfg(all(not(windows), not(target_os = "macos")))]
-    let base = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-
-    base.join("Documents")
-        .join("QQFlow")
-        .join("exports")
-        .to_string_lossy()
-        .to_string()
+    {
+        let base = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        base.join("Documents")
+            .join("QQFlow")
+            .join("exports")
+            .to_string_lossy()
+            .to_string()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1585,7 +1602,12 @@ fn deobfuscate_key(encoded_b64: &str) -> Option<String> {
         .map(|(i, &b)| b ^ XOR_KEY[i % XOR_KEY.len()])
         .collect();
     let key = String::from_utf8_lossy(&decoded).to_string();
-    if (8..=128).contains(&key.len()) {
+    let valid = if cfg!(windows) {
+        key.len() == 16
+    } else {
+        (8..=128).contains(&key.len())
+    };
+    if valid {
         Some(key)
     } else {
         None

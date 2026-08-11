@@ -95,7 +95,7 @@ function SettingsPage() {
                 <Info size={18} />
                 <div>
                   <div className="setting-title">QQFlow</div>
-                  <div className="setting-desc">v1.1.5 (Rust + Tauri) — QQ 聊天记录本地解密导出工具</div>
+                  <div className="setting-desc">v1.1.6 (Rust + Tauri) — QQ 聊天记录本地解密导出工具</div>
                 </div>
               </div>
             </div>
