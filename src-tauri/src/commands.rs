@@ -1,12 +1,11 @@
 /// Tauri command handlers.
 /// These replace the Flask API endpoints and Electron IPC proxy.
-
 use crate::analysis;
 use crate::db_scan;
 use crate::export_chat;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 #[cfg(windows)]
 use windows::Win32::Foundation::HANDLE;
@@ -109,7 +108,26 @@ pub fn ping() -> PingResponse {
 
 #[tauri::command]
 pub fn scan_databases() -> ScanResponse {
-    let dbs = db_scan::find_qq_databases();
+    let mut dbs = db_scan::find_qq_databases();
+
+    // macOS stores accounts under hashed directory names. Match every saved
+    // account key against each database so the UI can display the QQ number.
+    #[cfg(target_os = "macos")]
+    {
+        let saved_keys = load_keys_map();
+        for db in &mut dbs {
+            for (qq, encoded) in &saved_keys {
+                let Some(key) = deobfuscate_key(encoded) else {
+                    continue;
+                };
+                if export_chat::open_db_for_analysis(&db.path, &key).is_ok() {
+                    db.qq = qq.clone();
+                    break;
+                }
+            }
+        }
+    }
+
     ScanResponse {
         ok: true,
         databases: dbs,
@@ -118,7 +136,7 @@ pub fn scan_databases() -> ScanResponse {
 }
 
 #[tauri::command]
-pub fn extract_key(state: State<'_, AppState>) -> SimpleResponse {
+pub fn extract_key(state: State<'_, AppState>, qq: Option<String>) -> SimpleResponse {
     // Reset state
     {
         let mut log = state.key_log.lock().unwrap();
@@ -146,29 +164,35 @@ pub fn extract_key(state: State<'_, AppState>) -> SimpleResponse {
             level: "info".to_string(),
             text: "正在启动密钥提取...".to_string(),
         });
+        #[cfg(windows)]
         l.push(LogMessage {
             level: "warn".to_string(),
             text: "请在弹出的 QQ 窗口中登录账号".to_string(),
+        });
+        #[cfg(target_os = "macos")]
+        l.push(LogMessage {
+            level: "warn".to_string(),
+            text: "提取期间请保持 QQ 窗口可操作；稍后可能需要退出账号后重新登录".to_string(),
         });
     }
 
     // Spawn key extraction in background thread
     std::thread::spawn(move || {
-        match extract_key_impl() {
-            Some(key) => {
+        match extract_key_impl(qq.as_deref(), &log) {
+            Ok(key) => {
                 let mut l = log.lock().unwrap();
                 l.push(LogMessage {
                     level: "success".to_string(),
-                    text: format!("密钥获取成功: {}", key),
+                    text: "密钥获取并验证成功".to_string(),
                 });
                 *ok.lock().unwrap() = true;
                 *result.lock().unwrap() = Some(key);
             }
-            None => {
+            Err(error) => {
                 let mut l = log.lock().unwrap();
                 l.push(LogMessage {
                     level: "error".to_string(),
-                    text: "密钥提取失败".to_string(),
+                    text: error,
                 });
             }
         }
@@ -181,16 +205,302 @@ pub fn extract_key(state: State<'_, AppState>) -> SimpleResponse {
     }
 }
 
-#[cfg(windows)]
-fn extract_key_impl() -> Option<String> {
-    let qq_info = find_qq_installation()?;
-    let function_rva = analyze_pe(&qq_info.wrapper_node_path)?;
-    debug_extract_key(&qq_info.qq_exe_path, function_rva)
+fn push_key_log(log: &Arc<Mutex<Vec<LogMessage>>>, level: &str, text: impl Into<String>) {
+    if let Ok(mut messages) = log.lock() {
+        messages.push(LogMessage {
+            level: level.to_string(),
+            text: text.into(),
+        });
+    }
 }
 
-#[cfg(not(windows))]
-fn extract_key_impl() -> Option<String> {
-    None
+#[cfg(windows)]
+fn extract_key_impl(
+    _qq: Option<&str>,
+    _log: &Arc<Mutex<Vec<LogMessage>>>,
+) -> Result<String, String> {
+    let qq_info = find_qq_installation().ok_or("未找到 QQ NT 安装目录")?;
+    let function_rva = analyze_pe(&qq_info.wrapper_node_path).ok_or("无法定位 QQ 密钥函数")?;
+    debug_extract_key(&qq_info.qq_exe_path, function_rva).ok_or("密钥提取失败".to_string())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn extract_key_impl(
+    _qq: Option<&str>,
+    _log: &Arc<Mutex<Vec<LogMessage>>>,
+) -> Result<String, String> {
+    Err("当前平台暂不支持自动提取密钥".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn extract_key_impl(qq: Option<&str>, log: &Arc<Mutex<Vec<LogMessage>>>) -> Result<String, String> {
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn find_qq_app() -> Option<PathBuf> {
+        let mut candidates = vec![PathBuf::from("/Applications/QQ.app")];
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(PathBuf::from(home).join("Applications/QQ.app"));
+        }
+        candidates.into_iter().find(|path| path.is_dir())
+    }
+
+    fn find_qq_pid(app: &Path) -> Option<u32> {
+        let pattern = format!("{}/Contents/MacOS/QQ$", app.to_string_lossy());
+        let output = Command::new("/usr/bin/pgrep")
+            .args(["-f", &pattern])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    fn wrapper_is_loaded(pid: u32) -> bool {
+        Command::new("/usr/sbin/lsof")
+            .arg(format!("-p{}", pid))
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains("wrapper.node"))
+            .unwrap_or(false)
+    }
+
+    fn find_target_db() -> Option<PathBuf> {
+        let home = PathBuf::from(std::env::var("HOME").ok()?);
+        let bases = [
+            home.join("Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ"),
+            home.join("Library/Application Support/QQ"),
+        ];
+        let mut found = Vec::new();
+        for base in bases {
+            let Ok(entries) = std::fs::read_dir(base) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.file_name().to_string_lossy().starts_with("nt_qq_") {
+                    continue;
+                }
+                let path = entry.path().join("nt_db/nt_msg.db");
+                if path.is_file() {
+                    let modified = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(UNIX_EPOCH);
+                    found.push((modified, path));
+                }
+            }
+        }
+        found.sort_by(|a, b| b.0.cmp(&a.0));
+        found.into_iter().next().map(|(_, path)| path)
+    }
+
+    fn send_lldb(stdin: &mut std::process::ChildStdin, command: &str) -> Result<(), String> {
+        writeln!(stdin, "{}", command).map_err(|e| format!("无法控制 LLDB: {}", e))?;
+        stdin
+            .flush()
+            .map_err(|e| format!("无法刷新 LLDB 命令: {}", e))
+    }
+
+    fn stop_lldb(child: &mut std::process::Child, stdin: &mut std::process::ChildStdin) {
+        let _ = send_lldb(stdin, "process interrupt");
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = send_lldb(stdin, "process detach");
+        let _ = send_lldb(stdin, "quit");
+        for _ in 0..10 {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let qq_app = find_qq_app().ok_or("未找到 QQ.app，请先安装 macOS 版 QQ")?;
+    let wrapper = qq_app.join("Contents/Resources/app/wrapper.node");
+    if !wrapper.is_file() {
+        return Err("QQ 安装中缺少 wrapper.node，当前版本可能不兼容".to_string());
+    }
+    if !Command::new("/usr/bin/xcrun")
+        .args(["--find", "lldb"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Err("未找到 LLDB，请先安装 Xcode Command Line Tools".to_string());
+    }
+
+    let sip_output = Command::new("/usr/bin/csrutil").arg("status").output().ok();
+    let sip_enabled = sip_output
+        .as_ref()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .to_lowercase()
+                .contains("enabled")
+        })
+        .unwrap_or(false);
+    if sip_enabled {
+        return Err("macOS SIP 已开启，原版 QQ 不允许调试附加。请先关闭 SIP，或明确授权后将 QQ 改为 ad-hoc 本地签名。".to_string());
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let temp_dir =
+        std::env::temp_dir().join(format!("qqflow_key_{}_{}", std::process::id(), nonce));
+    std::fs::create_dir_all(&temp_dir).map_err(|e| format!("无法创建临时目录: {}", e))?;
+    let script_path = temp_dir.join("qq_key_extractor_macos.py");
+    let key_path = temp_dir.join("key.txt");
+    let breakpoint_path = temp_dir.join("breakpoint.txt");
+    std::fs::write(&script_path, include_str!("qq_key_extractor_macos.py"))
+        .map_err(|e| format!("无法准备 macOS 提取脚本: {}", e))?;
+
+    push_key_log(log, "info", "已确认 LLDB 权限，正在连接 QQ...");
+    let mut child = Command::new("/usr/bin/xcrun")
+        .arg("lldb")
+        .arg("--one-line")
+        .arg(format!(
+            "command script import {}",
+            script_path.to_string_lossy()
+        ))
+        .env("QQFLOW_WRAPPER_PATH", &wrapper)
+        .env("QQFLOW_KEY_RESULT_PATH", &key_path)
+        .env("QQFLOW_BP_RESULT_PATH", &breakpoint_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("无法启动 LLDB: {}", e))?;
+    let mut stdin = child.stdin.take().ok_or("无法连接 LLDB 标准输入")?;
+
+    let capture_result = (|| -> Result<String, String> {
+        let pid = match find_qq_pid(&qq_app) {
+            Some(pid) => pid,
+            None => {
+                Command::new("/usr/bin/open")
+                    .arg(&qq_app)
+                    .status()
+                    .map_err(|e| format!("无法启动 QQ: {}", e))?;
+                let mut pid = None;
+                for _ in 0..40 {
+                    std::thread::sleep(Duration::from_millis(500));
+                    pid = find_qq_pid(&qq_app);
+                    if pid.is_some() {
+                        break;
+                    }
+                }
+                pid.ok_or("启动后未找到 QQ 主进程")?
+            }
+        };
+        push_key_log(
+            log,
+            "info",
+            format!("已找到 QQ 进程 PID={}，正在附加...", pid),
+        );
+        send_lldb(&mut stdin, &format!("process attach --pid {}", pid))?;
+        std::thread::sleep(Duration::from_millis(1500));
+
+        if !wrapper_is_loaded(pid) {
+            send_lldb(&mut stdin, "process continue")?;
+            let mut loaded = false;
+            for _ in 0..120 {
+                std::thread::sleep(Duration::from_millis(500));
+                if wrapper_is_loaded(pid) {
+                    loaded = true;
+                    break;
+                }
+            }
+            if !loaded {
+                return Err("QQ 启动超时：wrapper.node 未加载".to_string());
+            }
+            send_lldb(&mut stdin, "process interrupt")?;
+            std::thread::sleep(Duration::from_millis(1200));
+        }
+
+        push_key_log(log, "info", "wrapper.node 已加载，正在设置密钥断点...");
+        send_lldb(&mut stdin, "qqflow-set-key-breakpoint")?;
+        let mut breakpoint_ready = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(250));
+            if breakpoint_path.is_file() {
+                breakpoint_ready = true;
+                break;
+            }
+        }
+        if !breakpoint_ready {
+            return Err("无法设置密钥断点；请确认 QQ 6.9.x 与 LLDB 调试权限可用".to_string());
+        }
+        send_lldb(&mut stdin, "process continue")?;
+        push_key_log(
+            log,
+            "warn",
+            "断点已就绪：若 QQ 已登录，请在 QQ 内退出账号后重新登录；不要关闭 QQ 进程",
+        );
+
+        let target_db = find_target_db();
+        if let Some(path) = &target_db {
+            push_key_log(
+                log,
+                "info",
+                format!("捕获后将使用数据库验证密钥: {}", path.display()),
+            );
+        } else {
+            push_key_log(log, "warn", "未找到 nt_msg.db，捕获后将无法自动验证密钥");
+        }
+
+        let mut last_candidate = String::new();
+        for tick in 0..720 {
+            std::thread::sleep(Duration::from_millis(250));
+            if tick > 0 && tick % 120 == 0 {
+                push_key_log(
+                    log,
+                    "info",
+                    "仍在等待 QQ 触发数据库打开，请完成一次退出账号并重新登录...",
+                );
+            }
+            let Ok(raw) = std::fs::read_to_string(&key_path) else {
+                continue;
+            };
+            let candidate = raw.trim().to_string();
+            if candidate.is_empty() || candidate == last_candidate {
+                continue;
+            }
+            last_candidate = candidate.clone();
+            push_key_log(
+                log,
+                "info",
+                format!("捕获到 {} 字节候选，正在验证...", candidate.len()),
+            );
+            if let Some(db_path) = &target_db {
+                match export_chat::open_db_for_analysis(&db_path.to_string_lossy(), &candidate) {
+                    Ok(_) => return Ok(candidate),
+                    Err(_) => {
+                        push_key_log(log, "warn", "该候选无法打开所选数据库，继续等待下一个调用");
+                        continue;
+                    }
+                }
+            }
+            if (8..=128).contains(&candidate.len()) {
+                return Ok(candidate);
+            }
+        }
+        let account = qq.filter(|value| !value.is_empty()).unwrap_or("所选账号");
+        Err(format!(
+            "180 秒内未捕获到 {} 的有效密钥；请重新提取，并在断点就绪后退出账号再登录",
+            account
+        ))
+    })();
+
+    stop_lldb(&mut child, &mut stdin);
+    let _ = std::fs::remove_file(&key_path);
+    let _ = std::fs::remove_file(&breakpoint_path);
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_dir(&temp_dir);
+    capture_result
 }
 
 #[cfg(windows)]
@@ -340,9 +650,9 @@ fn analyze_pe(wrapper_node_path: &str) -> Option<u64> {
 
     let lea_instruction_rva = lea_rva?;
 
-    let exception_section = sections.iter().find(|s| {
-        exception_dir_rva >= s.1 && exception_dir_rva < s.1 + s.2
-    })?;
+    let exception_section = sections
+        .iter()
+        .find(|s| exception_dir_rva >= s.1 && exception_dir_rva < s.1 + s.2)?;
 
     let ex_file_offset =
         exception_section.3 as usize + (exception_dir_rva as usize - exception_section.1 as usize);
@@ -382,14 +692,12 @@ fn debug_extract_key(qq_exe_path: &str, function_rva: u64) -> Option<String> {
         CloseHandle, BOOL, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, EXCEPTION_BREAKPOINT,
     };
     use windows::Win32::System::Diagnostics::Debug::{
-        ContinueDebugEvent,
-        EXCEPTION_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT,
-        LOAD_DLL_DEBUG_EVENT, WaitForDebugEvent,
-        DEBUG_EVENT,
+        ContinueDebugEvent, WaitForDebugEvent, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT,
+        EXIT_PROCESS_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT,
     };
     use windows::Win32::System::Threading::{
-        CreateProcessA, TerminateProcess, DEBUG_ONLY_THIS_PROCESS,
-        PROCESS_INFORMATION, STARTUPINFOA,
+        CreateProcessA, TerminateProcess, DEBUG_ONLY_THIS_PROCESS, PROCESS_INFORMATION,
+        STARTUPINFOA,
     };
 
     unsafe {
@@ -522,8 +830,8 @@ fn debug_extract_key(qq_exe_path: &str, function_rva: u64) -> Option<String> {
 unsafe fn get_module_base(pid: u32, module_name: &str) -> Option<u64> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
-        TH32CS_SNAPMODULE32, MODULEENTRY32W,
+        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
+        TH32CS_SNAPMODULE32,
     };
 
     let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid).ok()?;
@@ -617,7 +925,7 @@ unsafe fn restore_byte(h_process: HANDLE, addr: u64, byte: u8) {
 unsafe fn read_key_from_r8(_pid: u32, thread_id: u32, h_process: HANDLE) -> Option<String> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::Debug::{
-        CONTEXT, CONTEXT_ALL_AMD64, GetThreadContext, ReadProcessMemory,
+        GetThreadContext, ReadProcessMemory, CONTEXT, CONTEXT_ALL_AMD64,
     };
     use windows::Win32::System::Threading::{OpenThread, THREAD_ALL_ACCESS};
 
@@ -688,6 +996,23 @@ pub fn get_key_status(state: State<'_, AppState>) -> KeyStatusResponse {
 
 // ── Export ──
 
+fn default_export_dir() -> String {
+    #[cfg(any(windows, target_os = "macos"))]
+    let base = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let base = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+
+    base.join("Documents")
+        .join("QQFlow")
+        .join("exports")
+        .to_string_lossy()
+        .to_string()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ExportParams {
     pub db_path: String,
@@ -703,14 +1028,20 @@ pub fn clear_msg_store(state: State<'_, AppState>) -> SimpleResponse {
     let count = guard.len();
     guard.clear();
     eprintln!("[clear_msg_store] 已清除 {} 个缓存", count);
-    SimpleResponse { ok: true, error: None }
+    SimpleResponse {
+        ok: true,
+        error: None,
+    }
 }
 
 #[tauri::command]
 pub fn cancel_export(state: State<'_, AppState>) -> SimpleResponse {
     state.cancel_flag.store(true, Ordering::SeqCst);
     eprintln!("[cancel_export] 取消标志已设置");
-    SimpleResponse { ok: true, error: None }
+    SimpleResponse {
+        ok: true,
+        error: None,
+    }
 }
 
 #[tauri::command]
@@ -730,14 +1061,7 @@ pub fn start_export(state: State<'_, AppState>, params: ExportParams) -> SimpleR
     let store_mutex = state.msg_store.clone();
     let cancel_flag = state.cancel_flag.clone();
 
-    let output_dir = params
-        .output_dir
-        .unwrap_or_else(|| {
-            let mut p = std::env::current_exe().unwrap_or_default();
-            p.pop();
-            p.push("output");
-            p.to_string_lossy().to_string()
-        });
+    let output_dir = params.output_dir.unwrap_or_else(default_export_dir);
 
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -773,14 +1097,19 @@ pub fn start_export(state: State<'_, AppState>, params: ExportParams) -> SimpleR
                     });
                     eprintln!("[start_export] 开始加载 MessageStore: {}", &params.db_path);
                     match export_chat::MessageStore::load_with_progress(
-                        &params.db_path, &params.key,
+                        &params.db_path,
+                        &params.key,
                         Some(&log),
                     ) {
                         Ok(s) => {
                             let s = Arc::new(s);
                             log.lock().unwrap().push(LogMessage {
                                 level: "info".to_string(),
-                                text: format!("加载完成: {} 个群, {} 个私聊", s.group_msgs.len(), s.c2c_msgs.len()),
+                                text: format!(
+                                    "加载完成: {} 个群, {} 个私聊",
+                                    s.group_msgs.len(),
+                                    s.c2c_msgs.len()
+                                ),
                             });
                             let mut guard = store_mutex.lock().unwrap();
                             if let Some(existing) = guard.get(&params.db_path) {
@@ -791,7 +1120,10 @@ pub fn start_export(state: State<'_, AppState>, params: ExportParams) -> SimpleR
                             }
                         }
                         Err(e) => {
-                            log.lock().unwrap().push(LogMessage { level: "error".to_string(), text: e });
+                            log.lock().unwrap().push(LogMessage {
+                                level: "error".to_string(),
+                                text: e,
+                            });
                             return;
                         }
                     }
@@ -799,21 +1131,37 @@ pub fn start_export(state: State<'_, AppState>, params: ExportParams) -> SimpleR
             };
             let store_ref = Some(store.as_ref());
 
-            match export_chat::decrypt_and_export(&params.db_path, &params.key, &output_dir, params.group_ids.as_deref(), params.peer_ids.as_deref(), store_ref, Some(&log), Some(&cancel_flag)) {
+            match export_chat::decrypt_and_export(
+                &params.db_path,
+                &params.key,
+                &output_dir,
+                params.group_ids.as_deref(),
+                params.peer_ids.as_deref(),
+                store_ref,
+                Some(&log),
+                Some(&cancel_flag),
+            ) {
                 Ok(result) => {
                     log.lock().unwrap().push(LogMessage {
                         level: "success".to_string(),
-                        text: format!("导出完成: {} 条消息, {} 个群聊, {} 个私聊",
-                            result.total, result.groups, result.private),
+                        text: format!(
+                            "导出完成: {} 条消息, {} 个群聊, {} 个私聊",
+                            result.total, result.groups, result.private
+                        ),
                     });
                     *summary.lock().unwrap() = Some(ExportSummary {
-                        total: result.total, groups: result.groups,
-                        private_count: result.private, dir: output_dir,
+                        total: result.total,
+                        groups: result.groups,
+                        private_count: result.private,
+                        dir: output_dir,
                     });
                     *ok.lock().unwrap() = true;
                 }
                 Err(e) => {
-                    log.lock().unwrap().push(LogMessage { level: "error".to_string(), text: e });
+                    log.lock().unwrap().push(LogMessage {
+                        level: "error".to_string(),
+                        text: e,
+                    });
                 }
             }
         }));
@@ -883,12 +1231,7 @@ pub fn get_csv_progress(state: State<'_, AppState>) -> ProgressResponse {
 
 #[tauri::command]
 pub async fn export_csv(app: tauri::AppHandle, params: ExportParams) -> serde_json::Value {
-    let output_dir = params.output_dir.unwrap_or_else(|| {
-        let mut p = std::env::current_exe().unwrap_or_default();
-        p.pop();
-        p.push("output");
-        p.to_string_lossy().to_string()
-    });
+    let output_dir = params.output_dir.unwrap_or_else(default_export_dir);
     let dir = output_dir.clone();
     let store_mutex = app.state::<AppState>().msg_store.clone();
 
@@ -897,8 +1240,18 @@ pub async fn export_csv(app: tauri::AppHandle, params: ExportParams) -> serde_js
             Ok(s) => Some(s),
             Err(e) => return Err(e),
         };
-        analysis::export_csv(&params.db_path, &params.key, &output_dir, params.group_ids.as_deref(), params.peer_ids.as_deref(), store.as_deref(), None, None)
-    }).await;
+        analysis::export_csv(
+            &params.db_path,
+            &params.key,
+            &output_dir,
+            params.group_ids.as_deref(),
+            params.peer_ids.as_deref(),
+            store.as_deref(),
+            None,
+            None,
+        )
+    })
+    .await;
 
     match result {
         Ok(Ok(data)) => serde_json::json!({
@@ -919,7 +1272,10 @@ pub struct GroupAnalysisParams {
 }
 
 #[tauri::command]
-pub async fn analyze_group(app: tauri::AppHandle, params: GroupAnalysisParams) -> serde_json::Value {
+pub async fn analyze_group(
+    app: tauri::AppHandle,
+    params: GroupAnalysisParams,
+) -> serde_json::Value {
     let store_mutex = app.state::<AppState>().msg_store.clone();
 
     let result = tokio::task::spawn_blocking(move || {
@@ -933,11 +1289,18 @@ pub async fn analyze_group(app: tauri::AppHandle, params: GroupAnalysisParams) -
                 let store = {
                     let guard = store_mutex.lock().unwrap();
                     match guard.get(&params.db_path) {
-                        Some(s) => { eprintln!("[analyze_group] 缓存命中"); s.clone() }
+                        Some(s) => {
+                            eprintln!("[analyze_group] 缓存命中");
+                            s.clone()
+                        }
                         None => {
                             drop(guard);
                             eprintln!("[analyze_group] 缓存未命中, 加载 MessageStore...");
-                            match export_chat::MessageStore::load_with_progress(&params.db_path, &params.key, None) {
+                            match export_chat::MessageStore::load_with_progress(
+                                &params.db_path,
+                                &params.key,
+                                None,
+                            ) {
                                 Ok(s) => {
                                     let s = Arc::new(s);
                                     let mut g = store_mutex.lock().unwrap();
@@ -953,12 +1316,19 @@ pub async fn analyze_group(app: tauri::AppHandle, params: GroupAnalysisParams) -
                         }
                     }
                 };
-                analysis::analyze_group_detail(&params.db_path, &params.key, gid, Some(store.as_ref()), None)
-                    .map(|data| serde_json::json!({ "ok": true, "data": data }))
-                    .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }))
+                analysis::analyze_group_detail(
+                    &params.db_path,
+                    &params.key,
+                    gid,
+                    Some(store.as_ref()),
+                    None,
+                )
+                .map(|data| serde_json::json!({ "ok": true, "data": data }))
+                .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }))
             }
         }
-    }).await;
+    })
+    .await;
 
     match result {
         Ok(val) => val,
@@ -974,7 +1344,10 @@ pub struct PrivateAnalysisParams {
 }
 
 #[tauri::command]
-pub async fn analyze_private(app: tauri::AppHandle, params: PrivateAnalysisParams) -> serde_json::Value {
+pub async fn analyze_private(
+    app: tauri::AppHandle,
+    params: PrivateAnalysisParams,
+) -> serde_json::Value {
     let store_mutex = app.state::<AppState>().msg_store.clone();
 
     let result = tokio::task::spawn_blocking(move || {
@@ -988,11 +1361,18 @@ pub async fn analyze_private(app: tauri::AppHandle, params: PrivateAnalysisParam
                 let store = {
                     let guard = store_mutex.lock().unwrap();
                     match guard.get(&params.db_path) {
-                        Some(s) => { eprintln!("[analyze_private] 缓存命中"); s.clone() }
+                        Some(s) => {
+                            eprintln!("[analyze_private] 缓存命中");
+                            s.clone()
+                        }
                         None => {
                             drop(guard);
                             eprintln!("[analyze_private] 缓存未命中, 加载 MessageStore...");
-                            match export_chat::MessageStore::load_with_progress(&params.db_path, &params.key, None) {
+                            match export_chat::MessageStore::load_with_progress(
+                                &params.db_path,
+                                &params.key,
+                                None,
+                            ) {
                                 Ok(s) => {
                                     let s = Arc::new(s);
                                     let mut g = store_mutex.lock().unwrap();
@@ -1008,12 +1388,19 @@ pub async fn analyze_private(app: tauri::AppHandle, params: PrivateAnalysisParam
                         }
                     }
                 };
-                analysis::analyze_private_detail(&params.db_path, &params.key, pid, Some(store.as_ref()), None)
-                    .map(|data| serde_json::json!({ "ok": true, "data": data }))
-                    .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }))
+                analysis::analyze_private_detail(
+                    &params.db_path,
+                    &params.key,
+                    pid,
+                    Some(store.as_ref()),
+                    None,
+                )
+                .map(|data| serde_json::json!({ "ok": true, "data": data }))
+                .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }))
             }
         }
-    }).await;
+    })
+    .await;
 
     match result {
         Ok(val) => val,
@@ -1023,26 +1410,38 @@ pub async fn analyze_private(app: tauri::AppHandle, params: PrivateAnalysisParam
 
 fn load_store_if_needed(
     mtx: &Arc<Mutex<std::collections::HashMap<String, Arc<export_chat::MessageStore>>>>,
-    db_path: &str, key: &str,
+    db_path: &str,
+    key: &str,
 ) -> Result<Arc<export_chat::MessageStore>, String> {
     // Check cache first — keyed by db_path so different QQ accounts get different stores
     {
         let guard = mtx.lock().unwrap();
         if let Some(s) = guard.get(db_path) {
-            eprintln!("[load_store_if_needed] 缓存命中 (db_path={})，直接返回", db_path);
+            eprintln!(
+                "[load_store_if_needed] 缓存命中 (db_path={})，直接返回",
+                db_path
+            );
             return Ok(s.clone());
         }
     } // Lock released here before expensive operations
 
     // Load from database (potentially slow)
-    eprintln!("[load_store_if_needed] db_path={} 缓存未命中，开始加载数据库...", db_path);
+    eprintln!(
+        "[load_store_if_needed] db_path={} 缓存未命中，开始加载数据库...",
+        db_path
+    );
     let conn = export_chat::open_db_for_analysis(db_path, key)
         .map_err(|e| format!("打开数据库失败: {}", e))?;
     eprintln!("[load_store_if_needed] 数据库已打开，开始加载消息...");
-    let store = Arc::new(export_chat::MessageStore::load(&conn)
-        .map_err(|e| format!("加载消息失败: {}", e))?);
-    eprintln!("[load_store_if_needed] 消息加载完成: {} 个群, {} 个私聊",
-        store.group_msgs.len(), store.c2c_msgs.len());
+    let mut loaded =
+        export_chat::MessageStore::load(&conn).map_err(|e| format!("加载消息失败: {}", e))?;
+    loaded.profile_names = export_chat::load_profile_names(db_path, key);
+    let store = Arc::new(loaded);
+    eprintln!(
+        "[load_store_if_needed] 消息加载完成: {} 个群, {} 个私聊",
+        store.group_msgs.len(),
+        store.c2c_msgs.len()
+    );
 
     // Store in cache keyed by db_path
     let mut guard = mtx.lock().unwrap();
@@ -1066,28 +1465,40 @@ pub async fn debug_db_schema(params: PrivateAnalysisParams) -> serde_json::Value
         // Row counts for key tables
         let mut table_counts = serde_json::Map::new();
         for (name, _) in &tables {
-            let count: i64 = conn.query_row(
-                &format!("SELECT count(*) FROM \"{}\"", name.replace('"', "\"\"")),
-                [], |r| r.get(0)
-            ).unwrap_or(0);
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT count(*) FROM \"{}\"", name.replace('"', "\"\"")),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
             table_counts.insert(name.clone(), serde_json::json!(count));
         }
 
         // Sample from UID mapping table
         let uid_map = export_chat::load_uid_map(&conn);
-        let uid_sample: Vec<(String, String)> = uid_map.iter().take(5).map(|(k,v)| (k.clone(), v.clone())).collect();
+        let uid_sample: Vec<(String, String)> = uid_map
+            .iter()
+            .take(5)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
 
         // Sample from c2c_msg_table
         let c2c_sample: Vec<serde_json::Value> = {
-            let mut stmt = conn.prepare("SELECT \"40001\", \"40020\", \"40093\" FROM c2c_msg_table LIMIT 3")
+            let mut stmt = conn
+                .prepare("SELECT \"40001\", \"40020\", \"40093\" FROM c2c_msg_table LIMIT 3")
                 .map_err(|e| e.to_string())?;
-            let rows: Vec<serde_json::Value> = stmt.query_map([], |row| {
-                Ok(serde_json::json!({
-                    "40001": row.get::<_, i64>(0).unwrap_or(0),
-                    "40020": row.get::<_, String>(1).unwrap_or_default(),
-                    "40093": row.get::<_, String>(2).unwrap_or_default(),
-                }))
-            }).map_err(|e| e.to_string())?.flatten().collect();
+            let rows: Vec<serde_json::Value> = stmt
+                .query_map([], |row| {
+                    Ok(serde_json::json!({
+                        "40001": row.get::<_, i64>(0).unwrap_or(0),
+                        "40020": row.get::<_, String>(1).unwrap_or_default(),
+                        "40093": row.get::<_, String>(2).unwrap_or_default(),
+                    }))
+                })
+                .map_err(|e| e.to_string())?
+                .flatten()
+                .collect();
             rows
         };
 
@@ -1113,10 +1524,29 @@ pub async fn debug_db_schema(params: PrivateAnalysisParams) -> serde_json::Value
 const XOR_KEY: &[u8] = b"QQFlow2024!@#$%^";
 
 fn keys_file_path() -> std::path::PathBuf {
-    let app_data = std::env::var("APPDATA").unwrap_or_default();
-    std::path::PathBuf::from(app_data)
-        .join("qqflow")
-        .join("qqflow_keys.json")
+    #[cfg(windows)]
+    {
+        let app_data = std::env::var("APPDATA").unwrap_or_default();
+        return std::path::PathBuf::from(app_data)
+            .join("qqflow")
+            .join("qqflow_keys.json");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        return std::path::PathBuf::from(home)
+            .join("Library/Application Support/QQFlow/qqflow_keys.json");
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let base = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
+            });
+        base.join("qqflow/qqflow_keys.json")
+    }
 }
 
 fn load_keys_map() -> std::collections::HashMap<String, String> {
@@ -1147,18 +1577,15 @@ fn obfuscate_key(key: &str) -> String {
 }
 
 fn deobfuscate_key(encoded_b64: &str) -> Option<String> {
-    let obfuscated = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        encoded_b64,
-    )
-    .ok()?;
+    let obfuscated =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded_b64).ok()?;
     let decoded: Vec<u8> = obfuscated
         .iter()
         .enumerate()
         .map(|(i, &b)| b ^ XOR_KEY[i % XOR_KEY.len()])
         .collect();
     let key = String::from_utf8_lossy(&decoded).to_string();
-    if key.len() == 16 {
+    if (8..=128).contains(&key.len()) {
         Some(key)
     } else {
         None
@@ -1170,8 +1597,14 @@ pub fn save_key(key: String, qq_number: String) -> SimpleResponse {
     let mut map = load_keys_map();
     map.insert(qq_number, obfuscate_key(&key));
     match save_keys_map(&map) {
-        Ok(_) => SimpleResponse { ok: true, error: None },
-        Err(e) => SimpleResponse { ok: false, error: Some(e) },
+        Ok(_) => SimpleResponse {
+            ok: true,
+            error: None,
+        },
+        Err(e) => SimpleResponse {
+            ok: false,
+            error: Some(e),
+        },
     }
 }
 
@@ -1192,8 +1625,14 @@ pub fn clear_key(qq_number: String) -> SimpleResponse {
     let mut map = load_keys_map();
     map.remove(&qq_number);
     match save_keys_map(&map) {
-        Ok(_) => SimpleResponse { ok: true, error: None },
-        Err(e) => SimpleResponse { ok: false, error: Some(e) },
+        Ok(_) => SimpleResponse {
+            ok: true,
+            error: None,
+        },
+        Err(e) => SimpleResponse {
+            ok: false,
+            error: Some(e),
+        },
     }
 }
 

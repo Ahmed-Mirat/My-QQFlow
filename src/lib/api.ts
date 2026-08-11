@@ -10,7 +10,7 @@ export const api = {
   scanDatabases: () =>
     invoke<{ ok: boolean; databases: Database[]; error?: string }>('scan_databases'),
 
-  extractKey: () => invoke<SimpleResponse>('extract_key'),
+  extractKey: (qq?: string) => invoke<SimpleResponse>('extract_key', { qq }),
 
   getKeyStatus: () =>
     invoke<{ done: boolean; ok: boolean; key?: string; messages: LogMessage[] }>('get_key_status'),
@@ -50,7 +50,7 @@ export const api = {
 
   saveKey: (key: string, qqNumber: string) => invoke<SimpleResponse>('save_key', { key, qqNumber }),
 
-  loadKeys: () => invoke<{ ok: boolean; keys?: Record<string, string> }>('load_keys'),
+  loadKeys: () => invoke<{ ok: boolean; keys?: Record<string, string>; error?: string }>('load_keys'),
 
   clearKey: (qqNumber: string) => invoke<SimpleResponse>('clear_key', { qqNumber }),
 }

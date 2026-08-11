@@ -39,7 +39,7 @@ function KeyExtractPage() {
     setKeyExtracting(true)
     clearKeyLogs()
 
-    const result = await api.extractKey()
+    const result = await api.extractKey(selectedQq)
     if (!result.ok) {
       addKeyLog({ level: 'error', text: result.error || '启动密钥提取失败' })
       setKeyExtracting(false)
@@ -54,10 +54,18 @@ function KeyExtractPage() {
       if (keyStatus.done) {
         if (keyStatus.key) {
           if (selectedQq) {
-            await api.saveKey(keyStatus.key, selectedQq)
+            const saveResult = await api.saveKey(keyStatus.key, selectedQq)
+            if (!saveResult.ok) {
+              addKeyLog({ level: 'error', text: saveResult.error || '密钥已提取，但保存失败' })
+              setKeyExtracting(false)
+              return
+            }
             const keysResult = await api.loadKeys()
             if (keysResult.ok && keysResult.keys) {
               setSavedKeys(keysResult.keys)
+              addKeyLog({ level: 'success', text: `密钥已保存到账号 ${selectedQq}` })
+            } else {
+              addKeyLog({ level: 'error', text: keysResult.error || '密钥已保存，但重新加载失败' })
             }
           } else {
             addKeyLog({ level: 'warn', text: '密钥已提取，但未选择 QQ 号，密钥未保存' })
@@ -99,8 +107,8 @@ function KeyExtractPage() {
       <div className="page-content">
         <div className="key-intro-card">
           <h2>自动提取加密密钥</h2>
-          <p>QQ NT 使用 SQLCipher 加密聊天数据库。此工具通过 Windows 调试 API 自动从 QQ 进程中提取 16 位加密密钥。</p>
-          <p className="key-note">提取过程中会自动启动 QQ，请在弹出的窗口中登录账号。</p>
+          <p>QQ NT 使用 SQLCipher 加密聊天数据库。此工具在本机附加 QQ 进程，捕获并验证数据库密钥。</p>
+          <p className="key-note">Windows 会自动启动 QQ；macOS 会连接当前 QQ，断点就绪后可能需要在 QQ 内退出账号并重新登录。</p>
         </div>
 
         {/* Saved keys list */}

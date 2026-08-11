@@ -40,7 +40,7 @@ function DatabasePage() {
             <HardDrive size={48} />
             <h3>未找到数据库</h3>
             <p>请确保已安装 QQ NT 并至少登录过一次</p>
-            <p className="db-hint">数据库路径: %USERPROFILE%\Documents\Tencent Files\[QQ号]\nt_qq\nt_db\nt_msg.db</p>
+            <p className="db-hint">支持自动扫描 Windows 与 macOS 的 QQ NT 数据目录</p>
           </div>
         )}
         {databases.length > 0 && (

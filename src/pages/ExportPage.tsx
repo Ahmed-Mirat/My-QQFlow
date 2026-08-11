@@ -341,7 +341,7 @@ function ExportPage() {
             <div className="folder-select">
               <label>导出位置</label>
               <div className="folder-row">
-                <input type="text" className="folder-input" value={outputDir} placeholder="默认: 项目目录下的 output 文件夹" readOnly />
+                <input type="text" className="folder-input" value={outputDir} placeholder="默认: 文稿/QQFlow/exports" readOnly />
                 <button className="btn-secondary" onClick={handleSelectFolder}><FolderOpen size={16} /> 选择</button>
               </div>
             </div>
