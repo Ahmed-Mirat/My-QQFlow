@@ -1,6 +1,6 @@
 /// Chat export module.
 /// Decrypts SQLCipher database and exports messages as TXT or CSV.
-use crate::analysis::{normalize_ts, ts_to_str};
+use crate::analysis::{ts_to_local, ts_to_str};
 use crate::message_parser::extract_text;
 use chrono::Datelike;
 use rusqlite::Connection;
@@ -115,6 +115,7 @@ fn open_db_at_path(path: &std::path::Path, key: &str) -> Result<Connection, Stri
 #[derive(Debug, Clone)]
 pub struct GroupMsg {
     pub msg_id: i64,
+    pub timestamp: i64,
     pub uid: String,
     pub nick: String,
     pub blob: Vec<u8>,
@@ -123,6 +124,7 @@ pub struct GroupMsg {
 #[derive(Debug, Clone)]
 pub struct C2cMsg {
     pub msg_id: i64,
+    pub timestamp: i64,
     /// The other participant in the private conversation. On current QQ NT
     /// databases this comes from 40021 and is stable for both directions.
     pub peer: String,
@@ -160,25 +162,30 @@ impl MessageStore {
 
         // ── Group messages ──
         let mut group_msgs: HashMap<String, Vec<GroupMsg>> = HashMap::new();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT \"40021\", \"40001\", \"40020\", \"40093\", \"40800\" FROM group_msg_table",
-        ) {
+        let group_time_expr = message_timestamp_expr(conn, "group_msg_table");
+        let group_sql = format!(
+            "SELECT \"40021\", \"40001\", {}, \"40020\", \"40093\", \"40800\" FROM group_msg_table",
+            group_time_expr,
+        );
+        if let Ok(mut stmt) = conn.prepare(&group_sql) {
             if let Ok(rows) = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0).unwrap_or_default(),
                     row.get::<_, i64>(1).unwrap_or(0),
-                    row.get::<_, String>(2).unwrap_or_default(),
+                    row.get::<_, i64>(2).unwrap_or(0),
                     row.get::<_, String>(3).unwrap_or_default(),
-                    row.get::<_, Vec<u8>>(4).unwrap_or_default(),
+                    row.get::<_, String>(4).unwrap_or_default(),
+                    row.get::<_, Vec<u8>>(5).unwrap_or_default(),
                 ))
             }) {
                 eprintln!("[MessageStore::load] 开始加载群消息...");
                 let mut count = 0u64;
                 let t1 = Instant::now();
                 for row in rows.flatten() {
-                    let (gid, msg_id, uid, nick, blob) = row;
+                    let (gid, msg_id, timestamp, uid, nick, blob) = row;
                     group_msgs.entry(gid).or_default().push(GroupMsg {
                         msg_id,
+                        timestamp,
                         uid,
                         nick,
                         blob,
@@ -207,9 +214,10 @@ impl MessageStore {
         // Older schemas without 40021 retain the previous 40020 behavior.
         let mut c2c_msgs: HashMap<String, Vec<C2cMsg>> = HashMap::new();
         let conversation_col = c2c_conversation_column(conn);
+        let c2c_time_expr = message_timestamp_expr(conn, "c2c_msg_table");
         let c2c_sql = format!(
-            "SELECT \"{}\", \"40020\", \"40001\", \"40093\", \"40800\" FROM c2c_msg_table",
-            conversation_col,
+            "SELECT \"{}\", \"40020\", \"40001\", {}, \"40093\", \"40800\" FROM c2c_msg_table",
+            conversation_col, c2c_time_expr,
         );
         if let Ok(mut stmt) = conn.prepare(&c2c_sql) {
             if let Ok(rows) = stmt.query_map([], |row| {
@@ -217,14 +225,15 @@ impl MessageStore {
                     row.get::<_, String>(0).unwrap_or_default(),
                     row.get::<_, String>(1).unwrap_or_default(),
                     row.get::<_, i64>(2).unwrap_or(0),
-                    row.get::<_, String>(3).unwrap_or_default(),
-                    row.get::<_, Vec<u8>>(4).unwrap_or_default(),
+                    row.get::<_, i64>(3).unwrap_or(0),
+                    row.get::<_, String>(4).unwrap_or_default(),
+                    row.get::<_, Vec<u8>>(5).unwrap_or_default(),
                 ))
             }) {
                 eprintln!("[MessageStore::load] 开始加载私聊消息...");
                 let mut count = 0u64;
                 for row in rows.flatten() {
-                    let (conversation, sender, msg_id, nick, blob) = row;
+                    let (conversation, sender, msg_id, timestamp, nick, blob) = row;
                     let peer = if conversation.is_empty() {
                         sender.clone()
                     } else {
@@ -232,6 +241,7 @@ impl MessageStore {
                     };
                     c2c_msgs.entry(peer.clone()).or_default().push(C2cMsg {
                         msg_id,
+                        timestamp,
                         peer,
                         sender,
                         nick,
@@ -296,16 +306,20 @@ impl MessageStore {
         // ── Group messages ──
         log("正在加载群消息...");
         let mut group_msgs: HashMap<String, Vec<GroupMsg>> = HashMap::new();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT \"40021\", \"40001\", \"40020\", \"40093\", \"40800\" FROM group_msg_table",
-        ) {
+        let group_time_expr = message_timestamp_expr(&conn, "group_msg_table");
+        let group_sql = format!(
+            "SELECT \"40021\", \"40001\", {}, \"40020\", \"40093\", \"40800\" FROM group_msg_table",
+            group_time_expr,
+        );
+        if let Ok(mut stmt) = conn.prepare(&group_sql) {
             if let Ok(rows) = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0).unwrap_or_default(),
                     row.get::<_, i64>(1).unwrap_or(0),
-                    row.get::<_, String>(2).unwrap_or_default(),
+                    row.get::<_, i64>(2).unwrap_or(0),
                     row.get::<_, String>(3).unwrap_or_default(),
-                    row.get::<_, Vec<u8>>(4).unwrap_or_default(),
+                    row.get::<_, String>(4).unwrap_or_default(),
+                    row.get::<_, Vec<u8>>(5).unwrap_or_default(),
                 ))
             }) {
                 let mut count = 0u64;
@@ -318,9 +332,10 @@ impl MessageStore {
                             t1.elapsed().as_secs_f32()
                         ));
                     }
-                    let (gid, msg_id, uid, nick, blob) = row;
+                    let (gid, msg_id, timestamp, uid, nick, blob) = row;
                     group_msgs.entry(gid).or_default().push(GroupMsg {
                         msg_id,
+                        timestamp,
                         uid,
                         nick,
                         blob,
@@ -341,9 +356,10 @@ impl MessageStore {
         let mut c2c_msgs: HashMap<String, Vec<C2cMsg>> = HashMap::new();
         let t2 = Instant::now();
         let conversation_col = c2c_conversation_column(&conn);
+        let c2c_time_expr = message_timestamp_expr(&conn, "c2c_msg_table");
         let c2c_sql = format!(
-            "SELECT \"{}\", \"40020\", \"40001\", \"40093\", \"40800\" FROM c2c_msg_table",
-            conversation_col,
+            "SELECT \"{}\", \"40020\", \"40001\", {}, \"40093\", \"40800\" FROM c2c_msg_table",
+            conversation_col, c2c_time_expr,
         );
         if let Ok(mut stmt) = conn.prepare(&c2c_sql) {
             if let Ok(rows) = stmt.query_map([], |row| {
@@ -351,13 +367,14 @@ impl MessageStore {
                     row.get::<_, String>(0).unwrap_or_default(),
                     row.get::<_, String>(1).unwrap_or_default(),
                     row.get::<_, i64>(2).unwrap_or(0),
-                    row.get::<_, String>(3).unwrap_or_default(),
-                    row.get::<_, Vec<u8>>(4).unwrap_or_default(),
+                    row.get::<_, i64>(3).unwrap_or(0),
+                    row.get::<_, String>(4).unwrap_or_default(),
+                    row.get::<_, Vec<u8>>(5).unwrap_or_default(),
                 ))
             }) {
                 let mut count = 0u64;
                 for row in rows.flatten() {
-                    let (conversation, sender, msg_id, nick, blob) = row;
+                    let (conversation, sender, msg_id, timestamp, nick, blob) = row;
                     let peer = if conversation.is_empty() {
                         sender.clone()
                     } else {
@@ -365,6 +382,7 @@ impl MessageStore {
                     };
                     c2c_msgs.entry(peer.clone()).or_default().push(C2cMsg {
                         msg_id,
+                        timestamp,
                         peer,
                         sender,
                         nick,
@@ -943,6 +961,16 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
     found
 }
 
+/// Return a SQL expression for the send timestamp column. Modern QQ NT stores
+/// the message id in 40001 and the Unix send timestamp in 40050.
+pub fn message_timestamp_expr(conn: &Connection, table: &str) -> &'static str {
+    if table_has_column(conn, table, "40050") {
+        "\"40050\""
+    } else {
+        "NULL"
+    }
+}
+
 /// Return the field that identifies the other participant in a private chat.
 /// QQ NT 3.x/4.x uses 40021. Falling back to 40020 preserves support for old
 /// or reduced schemas where only the sender field is available.
@@ -1030,11 +1058,7 @@ pub fn decrypt_and_export(
 
     // ── Timestamp helpers for readable export ──
     fn format_date(ts: i64) -> String {
-        let secs = normalize_ts(ts);
-        if secs == 0 {
-            return String::new();
-        }
-        chrono::NaiveDateTime::from_timestamp_opt(secs, 0)
+        ts_to_local(ts)
             .map(|dt| {
                 let weekdays = ["日", "一", "二", "三", "四", "五", "六"];
                 let w = weekdays[dt.weekday().num_days_from_sunday() as usize];
@@ -1043,11 +1067,7 @@ pub fn decrypt_and_export(
             .unwrap_or_default()
     }
     fn format_time(ts: i64) -> String {
-        let secs = normalize_ts(ts);
-        if secs == 0 {
-            return String::new();
-        }
-        chrono::NaiveDateTime::from_timestamp_opt(secs, 0)
+        ts_to_local(ts)
             .map(|dt| dt.format("%H:%M:%S").to_string())
             .unwrap_or_default()
     }
@@ -1121,7 +1141,7 @@ pub fn decrypt_and_export(
 
             // Sort by timestamp for chronological order
             let mut sorted: Vec<&GroupMsg> = msgs.iter().collect();
-            sorted.sort_by_key(|m| m.msg_id);
+            sorted.sort_by_key(|m| (m.timestamp, m.msg_id));
 
             let fpath = groups_dir.join(format!("群_{}.txt", gid));
             let mut f = fs::File::create(&fpath).map_err(|e| format!("创建文件失败: {}", e))?;
@@ -1129,11 +1149,11 @@ pub fn decrypt_and_export(
             // Header
             let first_ts = sorted
                 .first()
-                .map(|m| ts_to_str(m.msg_id))
+                .map(|m| ts_to_str(m.timestamp))
                 .unwrap_or_default();
             let last_ts = sorted
                 .last()
-                .map(|m| ts_to_str(m.msg_id))
+                .map(|m| ts_to_str(m.timestamp))
                 .unwrap_or_default();
             writeln!(f, "{}", "=".repeat(50)).ok();
             if group_name.is_empty() {
@@ -1151,7 +1171,7 @@ pub fn decrypt_and_export(
             // Messages grouped by date
             let mut last_date = String::new();
             for (mi, m) in sorted.iter().enumerate() {
-                let ts = m.msg_id;
+                let ts = m.timestamp;
                 let date = format_date(ts);
                 let time = format_time(ts);
                 if date != last_date {
@@ -1225,18 +1245,18 @@ pub fn decrypt_and_export(
             );
 
             let mut sorted: Vec<&C2cMsg> = msgs.iter().collect();
-            sorted.sort_by_key(|m| m.msg_id);
+            sorted.sort_by_key(|m| (m.timestamp, m.msg_id));
 
             let fpath = private_dir.join(format!("{}.txt", label));
             let mut f = fs::File::create(&fpath).map_err(|e| format!("创建文件失败: {}", e))?;
 
             let first_ts = sorted
                 .first()
-                .map(|m| ts_to_str(m.msg_id))
+                .map(|m| ts_to_str(m.timestamp))
                 .unwrap_or_default();
             let last_ts = sorted
                 .last()
-                .map(|m| ts_to_str(m.msg_id))
+                .map(|m| ts_to_str(m.timestamp))
                 .unwrap_or_default();
             writeln!(f, "{}", "=".repeat(50)).ok();
             writeln!(f, "私聊：{}", label).ok();
@@ -1249,7 +1269,7 @@ pub fn decrypt_and_export(
 
             let mut last_date = String::new();
             for (mi, m) in sorted.iter().enumerate() {
-                let ts = m.msg_id;
+                let ts = m.timestamp;
                 let date = format_date(ts);
                 let time = format_time(ts);
                 if date != last_date {

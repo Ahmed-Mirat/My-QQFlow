@@ -2,7 +2,7 @@
 /// Provides group and private chat statistics, CSV export, and analysis data.
 /// Supports both in-memory MessageStore (fast) and direct SQL queries (fallback).
 use crate::message_parser::extract_text;
-use chrono::{Datelike, NaiveDateTime, Timelike, Weekday};
+use chrono::{DateTime, Datelike, Local, Timelike, Weekday};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -86,45 +86,51 @@ pub struct CsvExportData {
 
 // ── helpers ──
 
+const EARLIEST_UNIX_SECONDS: i64 = 631_152_000; // 1990-01-01
+const LATEST_UNIX_SECONDS: i64 = 4_102_444_800; // 2100-01-01
+
 pub fn normalize_ts(ts: i64) -> i64 {
-    if ts == 0 {
+    if ts <= 0 {
         return 0;
     }
-    if ts > 1_000_000_000_000_000_000 {
+    let secs = if ts >= 1_000_000_000_000_000_000 {
         ts / 1_000_000_000
-    } else if ts > 1_000_000_000_000 {
+    } else if ts >= 1_000_000_000_000_000 {
+        ts / 1_000_000
+    } else if ts >= 1_000_000_000_000 {
         ts / 1_000
     } else {
         ts
+    };
+    if (EARLIEST_UNIX_SECONDS..=LATEST_UNIX_SECONDS).contains(&secs) {
+        secs
+    } else {
+        0
     }
 }
 
-pub fn ts_to_str(ts: i64) -> String {
+pub fn ts_to_local(ts: i64) -> Option<DateTime<Local>> {
     let secs = normalize_ts(ts);
     if secs == 0 {
-        return String::new();
+        return None;
     }
-    NaiveDateTime::from_timestamp_opt(secs, 0)
+    DateTime::from_timestamp(secs, 0).map(|dt| dt.with_timezone(&Local))
+}
+
+pub fn ts_to_str(ts: i64) -> String {
+    ts_to_local(ts)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_default()
 }
 
 fn ts_to_hour(ts: i64) -> i32 {
-    let secs = normalize_ts(ts);
-    if secs == 0 {
-        return -1;
-    }
-    NaiveDateTime::from_timestamp_opt(secs, 0)
+    ts_to_local(ts)
         .map(|dt| dt.time().hour() as i32)
         .unwrap_or(-1)
 }
 
 fn ts_to_weekday(ts: i64) -> i32 {
-    let secs = normalize_ts(ts);
-    if secs == 0 {
-        return -1;
-    }
-    NaiveDateTime::from_timestamp_opt(secs, 0)
+    ts_to_local(ts)
         .map(|dt| match dt.weekday() {
             Weekday::Mon => 0,
             Weekday::Tue => 1,
@@ -138,23 +144,28 @@ fn ts_to_weekday(ts: i64) -> i32 {
 }
 
 fn ts_to_month(ts: i64) -> String {
-    let secs = normalize_ts(ts);
-    if secs == 0 {
-        return String::new();
-    }
-    NaiveDateTime::from_timestamp_opt(secs, 0)
+    ts_to_local(ts)
         .map(|dt| dt.format("%Y-%m").to_string())
         .unwrap_or_default()
 }
 
 fn ts_to_date(ts: i64) -> String {
-    let secs = normalize_ts(ts);
-    if secs == 0 {
-        return String::new();
-    }
-    NaiveDateTime::from_timestamp_opt(secs, 0)
+    ts_to_local(ts)
         .map(|dt| dt.format("%Y-%m-%d").to_string())
         .unwrap_or_default()
+}
+
+fn update_time_range(first: &mut i64, last: &mut i64, ts: i64) {
+    let secs = normalize_ts(ts);
+    if secs == 0 {
+        return;
+    }
+    if secs < *first {
+        *first = secs;
+    }
+    if secs > *last {
+        *last = secs;
+    }
 }
 
 fn weekday_name(i: i32) -> String {
@@ -296,12 +307,7 @@ pub fn analyze_group_detail(
         let mut last_id = i64::MIN;
 
         for m in msgs {
-            if m.msg_id < first_id {
-                first_id = m.msg_id;
-            }
-            if m.msg_id > last_id {
-                last_id = m.msg_id;
-            }
+            update_time_range(&mut first_id, &mut last_id, m.timestamp);
             let sender = super::export_chat::user_display_name(
                 &m.uid,
                 &m.nick,
@@ -310,20 +316,20 @@ pub fn analyze_group_detail(
             );
             let parsed = extract_text(&m.blob);
             *member_counts.entry(sender.clone()).or_insert(0) += 1;
-            let h = ts_to_hour(m.msg_id);
+            let h = ts_to_hour(m.timestamp);
             if h >= 0 {
                 *hourly.entry(h).or_insert(0) += 1;
             }
-            let w = ts_to_weekday(m.msg_id);
+            let w = ts_to_weekday(m.timestamp);
             if w >= 0 {
                 *weekday_counts.entry(w).or_insert(0) += 1;
             }
-            let mo = ts_to_month(m.msg_id);
+            let mo = ts_to_month(m.timestamp);
             if !mo.is_empty() {
                 *monthly.entry(mo).or_insert(0) += 1;
             }
             *type_counts.entry(parsed.msg_type.clone()).or_insert(0) += 1;
-            let ts = ts_to_str(m.msg_id);
+            let ts = ts_to_str(m.timestamp);
             if !ts.is_empty() {
                 member_first
                     .entry(sender.clone())
@@ -358,9 +364,12 @@ pub fn analyze_group_detail(
     let uid_map = super::export_chat::load_uid_map(&conn);
     let profile_names = super::export_chat::load_profile_names(db_path, key);
 
-    let mut stmt = conn.prepare(
-        "SELECT \"40001\", \"40020\", \"40093\", \"40800\" FROM group_msg_table WHERE \"40021\" = ?1"
-    ).map_err(|e| format!("SQL错误: {}", e))?;
+    let time_expr = super::export_chat::message_timestamp_expr(&conn, "group_msg_table");
+    let sql = format!(
+        "SELECT \"40001\", {}, \"40020\", \"40093\", \"40800\" FROM group_msg_table WHERE \"40021\" = ?1",
+        time_expr,
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("SQL错误: {}", e))?;
 
     let mut member_counts = HashMap::new();
     let mut member_first = HashMap::new();
@@ -378,39 +387,35 @@ pub fn analyze_group_detail(
         .query_map(rusqlite::params![group_id], |row| {
             Ok((
                 row.get::<_, i64>(0).unwrap_or(0),
-                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, i64>(1).unwrap_or(0),
                 row.get::<_, String>(2).unwrap_or_default(),
-                row.get::<_, Vec<u8>>(3).unwrap_or_default(),
+                row.get::<_, String>(3).unwrap_or_default(),
+                row.get::<_, Vec<u8>>(4).unwrap_or_default(),
             ))
         })
         .map_err(|e| format!("查询失败: {}", e))?;
 
     for row in rows {
-        let (msg_id, uid, nick, blob) = row.map_err(|e| e.to_string())?;
-        if msg_id < first_id {
-            first_id = msg_id;
-        }
-        if msg_id > last_id {
-            last_id = msg_id;
-        }
+        let (_msg_id, timestamp, uid, nick, blob) = row.map_err(|e| e.to_string())?;
+        update_time_range(&mut first_id, &mut last_id, timestamp);
         total += 1;
         let sender = super::export_chat::user_display_name(&uid, &nick, &profile_names, &uid_map);
         let parsed = extract_text(&blob);
         *member_counts.entry(sender.clone()).or_insert(0) += 1;
-        let h = ts_to_hour(msg_id);
+        let h = ts_to_hour(timestamp);
         if h >= 0 {
             *hourly.entry(h).or_insert(0) += 1;
         }
-        let w = ts_to_weekday(msg_id);
+        let w = ts_to_weekday(timestamp);
         if w >= 0 {
             *weekday_counts.entry(w).or_insert(0) += 1;
         }
-        let mo = ts_to_month(msg_id);
+        let mo = ts_to_month(timestamp);
         if !mo.is_empty() {
             *monthly.entry(mo).or_insert(0) += 1;
         }
         *type_counts.entry(parsed.msg_type.clone()).or_insert(0) += 1;
-        let ts = ts_to_str(msg_id);
+        let ts = ts_to_str(timestamp);
         if !ts.is_empty() {
             member_first
                 .entry(sender.clone())
@@ -537,33 +542,28 @@ pub fn analyze_private_detail(
         let mut last_id = i64::MIN;
 
         for m in msgs {
-            if m.msg_id < first_id {
-                first_id = m.msg_id;
-            }
-            if m.msg_id > last_id {
-                last_id = m.msg_id;
-            }
+            update_time_range(&mut first_id, &mut last_id, m.timestamp);
             let sender = super::export_chat::c2c_sender_label(m, uid_map, &store.profile_names);
             let parsed = extract_text(&m.blob);
             *counts.entry(sender.clone()).or_insert(0) += 1;
-            let h = ts_to_hour(m.msg_id);
+            let h = ts_to_hour(m.timestamp);
             if h >= 0 {
                 *hourly.entry(h).or_insert(0) += 1;
             }
-            let w = ts_to_weekday(m.msg_id);
+            let w = ts_to_weekday(m.timestamp);
             if w >= 0 {
                 *wday.entry(w).or_insert(0) += 1;
             }
-            let mo = ts_to_month(m.msg_id);
+            let mo = ts_to_month(m.timestamp);
             if !mo.is_empty() {
                 *monthly.entry(mo).or_insert(0) += 1;
             }
-            let d = ts_to_date(m.msg_id);
+            let d = ts_to_date(m.timestamp);
             if !d.is_empty() {
                 *daily.entry(d).or_insert(0) += 1;
             }
             *types.entry(parsed.msg_type.clone()).or_insert(0) += 1;
-            let ts = ts_to_str(m.msg_id);
+            let ts = ts_to_str(m.timestamp);
             if !ts.is_empty() {
                 first_ts.entry(sender.clone()).or_insert_with(|| ts.clone());
                 last_ts.insert(sender, ts);
@@ -594,9 +594,10 @@ pub fn analyze_private_detail(
     let uid_map = super::export_chat::load_uid_map(&conn);
     let profile_names = super::export_chat::load_profile_names(db_path, key);
     let conversation_col = super::export_chat::c2c_conversation_column(&conn);
+    let time_expr = super::export_chat::message_timestamp_expr(&conn, "c2c_msg_table");
     let sql = format!(
-        "SELECT \"40001\", \"40020\", \"40093\", \"40800\" FROM c2c_msg_table WHERE \"{}\" = ?1",
-        conversation_col,
+        "SELECT \"40001\", {}, \"40020\", \"40093\", \"40800\" FROM c2c_msg_table WHERE \"{}\" = ?1",
+        time_expr, conversation_col,
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
@@ -617,47 +618,43 @@ pub fn analyze_private_detail(
         .query_map(rusqlite::params![peer_uid], |row| {
             Ok((
                 row.get::<_, i64>(0).unwrap_or(0),
-                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, i64>(1).unwrap_or(0),
                 row.get::<_, String>(2).unwrap_or_default(),
-                row.get::<_, Vec<u8>>(3).unwrap_or_default(),
+                row.get::<_, String>(3).unwrap_or_default(),
+                row.get::<_, Vec<u8>>(4).unwrap_or_default(),
             ))
         })
         .map_err(|e| e.to_string())?;
 
     for row in rows {
-        let (msg_id, sender_uid, nick, blob) = match row {
+        let (_msg_id, timestamp, sender_uid, nick, blob) = match row {
             Ok(r) => r,
             Err(_) => continue,
         };
-        if msg_id < first_id {
-            first_id = msg_id;
-        }
-        if msg_id > last_id {
-            last_id = msg_id;
-        }
+        update_time_range(&mut first_id, &mut last_id, timestamp);
         total += 1;
         let sender =
             super::export_chat::user_display_name(&sender_uid, &nick, &profile_names, &uid_map);
         let parsed = extract_text(&blob);
         *counts.entry(sender.clone()).or_insert(0) += 1;
-        let h = ts_to_hour(msg_id);
+        let h = ts_to_hour(timestamp);
         if h >= 0 {
             *hourly.entry(h).or_insert(0) += 1;
         }
-        let w = ts_to_weekday(msg_id);
+        let w = ts_to_weekday(timestamp);
         if w >= 0 {
             *wday.entry(w).or_insert(0) += 1;
         }
-        let mo = ts_to_month(msg_id);
+        let mo = ts_to_month(timestamp);
         if !mo.is_empty() {
             *monthly.entry(mo).or_insert(0) += 1;
         }
-        let d = ts_to_date(msg_id);
+        let d = ts_to_date(timestamp);
         if !d.is_empty() {
             *daily.entry(d).or_insert(0) += 1;
         }
         *types.entry(parsed.msg_type.clone()).or_insert(0) += 1;
-        let ts = ts_to_str(msg_id);
+        let ts = ts_to_str(timestamp);
         if !ts.is_empty() {
             first_ts.entry(sender.clone()).or_insert_with(|| ts.clone());
             last_ts.insert(sender, ts);
@@ -878,7 +875,7 @@ pub fn export_csv(
                 };
                 let parsed = extract_text(&m.blob);
                 wtr.write_record([
-                    &ts_to_str(m.msg_id),
+                    &ts_to_str(m.timestamp),
                     sender,
                     &parsed.msg_type,
                     &parsed.content,
@@ -918,12 +915,12 @@ pub fn export_csv(
             wtr.write_record(["时间", "发送者", "类型", "内容"])
                 .map_err(|e| e.to_string())?;
             let mut sorted: Vec<&crate::export_chat::C2cMsg> = msgs.iter().collect();
-            sorted.sort_by_key(|m| m.msg_id);
+            sorted.sort_by_key(|m| (m.timestamp, m.msg_id));
             for m in sorted {
                 let sender = super::export_chat::c2c_sender_label(m, uid_map, &store.profile_names);
                 let parsed = extract_text(&m.blob);
                 wtr.write_record([
-                    &ts_to_str(m.msg_id),
+                    &ts_to_str(m.timestamp),
                     &sender,
                     &parsed.msg_type,
                     &parsed.content,
@@ -976,9 +973,12 @@ pub fn export_csv(
     }
 
     for gid in &group_ids {
-        let mut stmt = conn.prepare(
-            "SELECT \"40001\", \"40020\", \"40093\", \"40800\" FROM group_msg_table WHERE \"40021\" = ?1"
-        ).map_err(|e| e.to_string())?;
+        let group_time_expr = super::export_chat::message_timestamp_expr(&conn, "group_msg_table");
+        let group_sql = format!(
+            "SELECT \"40001\", {}, \"40020\", \"40093\", \"40800\" FROM group_msg_table WHERE \"40021\" = ?1 ORDER BY {}, \"40001\" ASC",
+            group_time_expr, group_time_expr,
+        );
+        let mut stmt = conn.prepare(&group_sql).map_err(|e| e.to_string())?;
         let csv_path = groups_dir.join(format!("群_{}.csv", gid));
         let mut file = std::fs::File::create(&csv_path).map_err(|e| e.to_string())?;
         use std::io::Write;
@@ -992,14 +992,15 @@ pub fn export_csv(
             .query_map(rusqlite::params![gid], |row| {
                 Ok((
                     row.get::<_, i64>(0).unwrap_or(0),
-                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, i64>(1).unwrap_or(0),
                     row.get::<_, String>(2).unwrap_or_default(),
-                    row.get::<_, Vec<u8>>(3).unwrap_or_default(),
+                    row.get::<_, String>(3).unwrap_or_default(),
+                    row.get::<_, Vec<u8>>(4).unwrap_or_default(),
                 ))
             })
             .map_err(|e| e.to_string())?;
         for row in rows.flatten() {
-            let (msg_id, uid, nick, blob) = row;
+            let (_msg_id, timestamp, uid, nick, blob) = row;
             let sender = if !nick.is_empty() {
                 nick
             } else {
@@ -1007,7 +1008,7 @@ pub fn export_csv(
             };
             let parsed = extract_text(&blob);
             wtr.write_record([
-                &ts_to_str(msg_id),
+                &ts_to_str(timestamp),
                 &sender,
                 &parsed.msg_type,
                 &parsed.content,
@@ -1050,9 +1051,10 @@ pub fn export_csv(
         _ => Vec::new(),
     };
     for uid in &peer_uids {
+        let c2c_time_expr = super::export_chat::message_timestamp_expr(&conn, "c2c_msg_table");
         let sql = format!(
-            "SELECT \"40001\", \"40020\", \"40093\", \"40800\" FROM c2c_msg_table WHERE \"{}\" = ?1 ORDER BY \"40001\" ASC",
-            c2c_conversation_col,
+            "SELECT \"40001\", {}, \"40020\", \"40093\", \"40800\" FROM c2c_msg_table WHERE \"{}\" = ?1 ORDER BY {}, \"40001\" ASC",
+            c2c_time_expr, c2c_conversation_col, c2c_time_expr,
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let label = uid_map.get(uid).cloned().unwrap_or_else(|| uid.clone());
@@ -1069,14 +1071,15 @@ pub fn export_csv(
             .query_map(rusqlite::params![uid], |row| {
                 Ok((
                     row.get::<_, i64>(0).unwrap_or(0),
-                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, i64>(1).unwrap_or(0),
                     row.get::<_, String>(2).unwrap_or_default(),
-                    row.get::<_, Vec<u8>>(3).unwrap_or_default(),
+                    row.get::<_, String>(3).unwrap_or_default(),
+                    row.get::<_, Vec<u8>>(4).unwrap_or_default(),
                 ))
             })
             .map_err(|e| e.to_string())?;
         for row in rows.flatten() {
-            let (msg_id, sender_uid, nick, blob) = row;
+            let (_msg_id, timestamp, sender_uid, nick, blob) = row;
             let sender = if !nick.is_empty() {
                 nick
             } else {
@@ -1087,7 +1090,7 @@ pub fn export_csv(
             };
             let parsed = extract_text(&blob);
             wtr.write_record([
-                &ts_to_str(msg_id),
+                &ts_to_str(timestamp),
                 &sender,
                 &parsed.msg_type,
                 &parsed.content,
@@ -1109,4 +1112,24 @@ pub fn export_csv(
         total,
         files,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_unix_timestamp_units() {
+        let secs = 1_786_434_731;
+        assert_eq!(normalize_ts(secs), secs);
+        assert_eq!(normalize_ts(secs * 1_000), secs);
+        assert_eq!(normalize_ts(secs * 1_000_000), secs);
+        assert_eq!(normalize_ts(secs * 1_000_000_000), secs);
+    }
+
+    #[test]
+    fn rejects_message_ids_as_timestamps() {
+        assert_eq!(normalize_ts(7_672_678_742_568_924_966), 0);
+        assert_eq!(ts_to_str(7_672_678_742_568_924_966), "");
+    }
 }
